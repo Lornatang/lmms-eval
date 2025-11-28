@@ -22,6 +22,7 @@ AVAILABLE_SIMPLE_MODELS = {
     "claude": "Claude",
     "cogvlm2": "CogVLM2",
     "egogpt": "EgoGPT",
+    "fastvlm": "FastVLM",
     "from_log": "FromLog",
     "fuyu": "Fuyu",
     "gemini_api": "GeminiAPI",
