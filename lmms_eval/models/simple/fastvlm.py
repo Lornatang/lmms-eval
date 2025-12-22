@@ -49,7 +49,7 @@ class FastVLM(lmms):
         model_name=None,
         attn_implementation="flash_attention_2",
         device_map="cuda:0",
-        conv_template="qwen2",
+        conv_template="qwen",
         use_cache=True,
         tie_weights: bool = True,
         truncate_context=False,  # whether to truncate the context in generation, set it False for LLaVA-1.6
