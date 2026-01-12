@@ -102,6 +102,34 @@ def handle_non_serializable(o):
         return str(o)
 
 
+def is_multimodal_content(value: Any) -> bool:
+    """
+    Check if a value is multimodal content (image, audio, video) that should
+    not be serialized to log files.
+
+    Returns True for:
+    - PIL.Image objects
+    - numpy arrays (typically image/audio data)
+    - bytes (binary data)
+    - torch tensors
+    - dicts with 'array' key (HuggingFace audio format)
+    - dicts with 'bytes' key (HuggingFace image format)
+    """
+    if isinstance(value, (bytes, bytearray, np.ndarray, torch.Tensor)):
+        return True
+    if isinstance(value, dict):
+        if "array" in value or "bytes" in value:
+            return True
+    try:
+        from PIL import Image
+
+        if isinstance(value, Image.Image):
+            return True
+    except ImportError:
+        pass
+    return False
+
+
 def sanitize_list(sub):
     """
     Takes possible nested list and recursively converts all inner component to strings
@@ -671,14 +699,25 @@ def import_function(loader, node):
     *module_name, function_name = function_name.split(".")
     if isinstance(module_name, list):
         module_name = ".".join(module_name)
+
+    # 1) Try relative file import (original behavior)
     module_path = os.path.normpath(os.path.join(yaml_path, "{}.py".format(module_name)))
+    if os.path.exists(module_path):
+        spec = importlib.util.spec_from_file_location(module_name, module_path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        function = getattr(module, function_name)
+        return function
 
-    spec = importlib.util.spec_from_file_location(module_name, module_path)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-
-    function = getattr(module, function_name)
-    return function
+    # 2) Fallback to absolute module import (enables cross-task utils like
+    #    lmms_eval.tasks.librispeech.utils.librispeech_doc_to_audio)
+    try:
+        module = importlib.import_module(module_name)
+        function = getattr(module, function_name)
+        return function
+    except Exception as ex:
+        # Re-raise with context to aid debugging
+        raise ImportError(f"Failed to import function '{function_name}' from module '{module_name}'. " f"Tried relative path '{module_path}' and absolute import.") from ex
 
 
 def load_yaml_config(yaml_path=None, yaml_config=None, yaml_dir=None, mode="full"):

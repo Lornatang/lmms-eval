@@ -1,6 +1,7 @@
 import os
 import re
 import unicodedata
+from typing import Any
 
 import editdistance as ed  # TODO: new package
 import zhconv  # TODO: new package
@@ -179,6 +180,10 @@ def compute_wer(refs, hyps, language):
         distance += ed.eval(ref_items, pred_items)
         ref_length += len(ref_items)
     return distance / ref_length
+
+
+def librispeech_doc_to_target(doc: Any):
+    return doc["gt"]
 
 
 def librispeech_wer(results, args):

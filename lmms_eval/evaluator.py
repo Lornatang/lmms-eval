@@ -41,6 +41,7 @@ from lmms_eval.utils import (
     get_git_commit_hash,
     handle_non_serializable,
     hash_string,
+    is_multimodal_content,
     make_table,
     positional_deprecated,
     run_task_tests,
@@ -562,13 +563,8 @@ def evaluate(
                     target = task.doc_to_target(doc)
                     saved_doc = {}
                     for key, value in doc.items():
-                        # If image is not in key
-                        if "image" not in key:
-                            # If audio is also not the value
-                            if isinstance(value, dict) and "array" in value:
-                                continue
-                            else:
-                                saved_doc[key] = value
+                        if not is_multimodal_content(value):
+                            saved_doc[key] = value
                     filtered_arguments = []
                     for req in requests:
                         # check if req.args is a list of tuples, and each item in the list is a serializable object
@@ -582,6 +578,7 @@ def evaluate(
                         "doc_id": doc_id,
                         "doc": saved_doc,
                         "target": target,
+                        # "pred": metrics['coco_cap_chair_i']['pred'],
                         "arguments": filtered_arguments,
                         "resps": [req.resps for req in requests],
                         "filtered_resps": [req.filtered_resps[filter_key] for req in requests],
