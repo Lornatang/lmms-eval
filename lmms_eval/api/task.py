@@ -10,17 +10,13 @@ import re
 import shutil
 import subprocess
 from collections.abc import Callable
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass
 from functools import partial
 from glob import glob
 from typing import (
     Any,
-    Dict,
-    Iterable,
     Iterator,
     List,
-    Literal,
-    Mapping,
     Optional,
     Tuple,
     Union,
@@ -44,7 +40,6 @@ from lmms_eval.api.registry import (
     AGGREGATION_REGISTRY,
     DEFAULT_METRIC_REGISTRY,
     METRIC_REGISTRY,
-    OUTPUT_TYPE_REGISTRY,
     get_aggregation,
     get_metric,
     get_metric_aggregation,
@@ -110,6 +105,10 @@ class TaskConfig(dict):
     should_decontaminate: bool = False
     doc_to_decontamination_query: str = None
 
+    # Statistical evaluation options
+    cluster_key: str = None  # Field name in process_results dict for clustering (e.g., "videoID")
+    score_key: str = "score"  # Field name in process_results dict for 0/1 score (default: "score")
+
     metadata: Union[str, list] = None  # by default, not used in the code. allows for users to pass arbitrary info to tasks
 
     lmms_eval_specific_kwargs: dict = None
@@ -118,8 +117,7 @@ class TaskConfig(dict):
 
     def __post_init__(self) -> None:
         if self.dataset_path and os.path.exists(os.path.dirname(self.dataset_path)):
-            import inspect
-            from importlib import import_module
+            pass
 
             # self.dataset_path = inspect.getfile(import_module(self.dataset_path))
 
@@ -1005,10 +1003,10 @@ class ConfigurableTask(Task):
                             eval_logger.info(f"Extracting following tar files: {parts}")
                             output_tar = base_name + ".tar"
                             if not os.path.exists(output_tar):
-                                eval_logger.info(f"Start concatenating tar files")
+                                eval_logger.info("Start concatenating tar files")
 
                                 concat_tar_parts(parts, output_tar)
-                                eval_logger.info(f"Finish concatenating tar files")
+                                eval_logger.info("Finish concatenating tar files")
 
                             if not os.path.exists(os.path.join(cache_dir, os.path.basename(base_name))):
                                 untar_video_data(output_tar)

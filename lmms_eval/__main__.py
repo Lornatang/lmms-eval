@@ -1,9 +1,37 @@
+import sys
+
+# Early TUI detection - before heavy imports
+if "--tui" in sys.argv:
+    try:
+        from lmms_eval.tui.cli import main as tui_main
+
+        tui_main()
+        sys.exit(0)
+    except ImportError as e:
+        print("TUI mode requires 'textual' package. Install with: pip install lmms_eval[tui]")
+        print(f"Error: {e}")
+        sys.exit(1)
+
+# Show quick help when no args provided (before heavy imports)
+if len(sys.argv) == 1:
+    print("┌───────────────────────────────────────────────────────────────────────────────┐")
+    print("│ LMMs-Eval: Evaluation framework for Large Multimodal Models                   │")
+    print("├───────────────────────────────────────────────────────────────────────────────┤")
+    print("│ Usage:                                                                        │")
+    print("│   lmms-eval --model MODEL --tasks TASKS [options]                             │")
+    print("│   lmms-eval --tui              # Interactive TUI mode                         │")
+    print("│   lmms-eval --help             # Full help                                    │")
+    print("├───────────────────────────────────────────────────────────────────────────────┤")
+    print("│ Example:                                                                      │")
+    print("│   lmms-eval --model llava --tasks mme --batch_size 1                          │")
+    print("└───────────────────────────────────────────────────────────────────────────────┘")
+    sys.exit(0)
+
 import argparse
 import datetime
 import importlib
 import json
 import os
-import sys
 import traceback
 import warnings
 from functools import partial
@@ -14,21 +42,20 @@ import yaml
 
 warnings.simplefilter("ignore", category=DeprecationWarning)
 
-import hashlib
-from pathlib import Path
 from typing import Union
 
 from accelerate import Accelerator
 from accelerate.utils import InitProcessGroupKwargs
 from loguru import logger as eval_logger
 
+import lmms_eval.tasks
 from lmms_eval import evaluator, utils
+from lmms_eval.api.metrics import power_analysis
 from lmms_eval.api.registry import ALL_TASKS
 from lmms_eval.evaluator import request_caching_arg_to_dict
 from lmms_eval.loggers import EvaluationTracker, WandbLogger
 from lmms_eval.tasks import TaskManager
 from lmms_eval.utils import (
-    handle_non_serializable,
     make_table,
     simple_parse_args_string,
 )
@@ -53,7 +80,7 @@ def _int_or_none_list_arg_type(min_len: int, max_len: int, defaults: str, value:
     elif num_items < min_len or num_items > max_len:
         raise argparse.ArgumentTypeError(f"Argument requires {max_len} integers or None, separated by '{split_char}'")
     elif num_items != max_len:
-        logging.warning(f"Argument requires {max_len} integers or None, separated by '{split_char}'. " "Missing values will be filled with defaults.")
+        eval_logger.warning(f"Argument requires {max_len} integers or None, separated by '{split_char}'. " "Missing values will be filled with defaults.")
         default_items = [parse_value(v) for v in defaults.split(split_char)]
         items.extend(default_items[num_items:])  # extend items list with missing defaults
 
@@ -81,9 +108,74 @@ def _handle_non_serializable(o):
         return str(o)
 
 
+def _run_power_analysis(args: argparse.Namespace) -> None:
+    """Run power analysis to calculate minimum sample size for detecting a given effect."""
+    task_sizes = {}
+    if args.tasks and args.tasks not in ["list", "list_groups", "list_tags", "list_subtasks"]:
+        task_manager = TaskManager(args.verbosity, include_path=args.include_path)
+        task_names = task_manager.match_tasks(args.tasks.split(","))
+        for task_name in task_names:
+            task_dict = lmms_eval.tasks.get_task_dict([task_name], task_manager)
+            for name, task_obj in task_dict.items():
+                if hasattr(task_obj, "eval_docs"):
+                    task_sizes[name] = len(task_obj.eval_docs)
+
+    result = power_analysis(
+        effect_size=args.effect_size,
+        std_a=args.std_a,
+        std_b=args.std_b,
+        alpha=args.alpha,
+        power=args.power,
+        correlation=args.correlation,
+    )
+
+    print("\n" + "=" * 60)
+    print("POWER ANALYSIS RESULTS")
+    print("=" * 60)
+    print(f"\nParameters:")
+    print(f"  Effect size (delta):     {args.effect_size:.1%}")
+    print(f"  Std (model A):           {result['std_a']}")
+    print(f"  Std (model B):           {result['std_b']}")
+    print(f"  Significance level (α):  {args.alpha}")
+    print(f"  Desired power (1-β):     {args.power}")
+    print(f"  Correlation (ρ):         {args.correlation}")
+    print(f"\nResult:")
+    print(f"  Minimum sample size:     n = {result['min_n']}")
+    print(f"\nInterpretation:")
+    print(f"  To detect a {args.effect_size:.1%} difference with {args.power:.0%} power,")
+    print(f"  you need at least {result['min_n']} questions in your benchmark.")
+
+    if task_sizes:
+        print(f"\n" + "-" * 60)
+        print("TASK ANALYSIS")
+        print("-" * 60)
+        for task_name, n_samples in task_sizes.items():
+            task_result = power_analysis(
+                effect_size=args.effect_size,
+                std_a=args.std_a,
+                std_b=args.std_b,
+                alpha=args.alpha,
+                power=args.power,
+                correlation=args.correlation,
+                current_n=n_samples,
+            )
+            status = "✓ Sufficient" if n_samples >= result["min_n"] else "✗ Insufficient"
+            print(f"\n  {task_name}:")
+            print(f"    Sample size:         n = {n_samples}")
+            print(f"    Current power:       {task_result['current_power']:.1%}")
+            print(f"    Min detectable Δ:    {task_result['min_detectable_effect']:.1%}")
+            print(f"    Status:              {status}")
+
+    print("\n" + "=" * 60 + "\n")
+
+
 def parse_eval_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(formatter_class=argparse.RawTextHelpFormatter)
-    parser.add_argument("--config", default="", help="Path to a yaml file specifying all eval arguments, will ignore cli arguments if specified")
+    parser.add_argument(
+        "--config",
+        default="",
+        help="Path to a yaml file specifying all eval arguments, will ignore cli arguments if specified",
+    )
     parser.add_argument("--model", default="hf", help="Name of model e.g. `hf`")
     parser.add_argument(
         "--tasks",
@@ -272,8 +364,74 @@ def parse_eval_args() -> argparse.Namespace:
         action="store_true",
         help="Sets trust_remote_code to True to execute code to create HF Datasets from the Hub",
     )
-    parser.add_argument("--process_with_media", action="store_true", help="Whether you will process you dataset with audio, image. By default set to False" "In case some benchmarks need to be processed with media, set this flag to True.")
-    parser.add_argument("--force_simple", action="store_true", help="Force the evaluation to use the simple mode of the models")
+    parser.add_argument(
+        "--process_with_media",
+        action="store_true",
+        help="Whether you will process you dataset with audio, image. By default set to False" "In case some benchmarks need to be processed with media, set this flag to True.",
+    )
+    parser.add_argument(
+        "--force_simple",
+        action="store_true",
+        help="Force the evaluation to use the simple mode of the models",
+    )
+    parser.add_argument(
+        "--tui",
+        action="store_true",
+        help="Launch interactive TUI mode for configuration",
+    )
+    parser.add_argument(
+        "-n",
+        "--num_samples",
+        type=int,
+        default=1,
+        help="Number of samples per question for model stability measurement. " "When n > 1, enables k-samples mode and computes EA, CA, IV, CR metrics.",
+    )
+    parser.add_argument("--baseline", type=str, default=None, help="Baseline for paired t-test comparison. Accepts: local JSONL path, hf://user/repo, or preset name (e.g., qwen25vl).")
+
+    # Power Analysis arguments
+    parser.add_argument(
+        "--power-analysis",
+        action="store_true",
+        default=False,
+        help="Enable power analysis to calculate minimum sample size for detecting a given effect size.",
+    )
+    parser.add_argument(
+        "--effect-size",
+        type=float,
+        default=0.03,
+        help="Minimum effect size to detect (default: 0.03 = 3%%). Used with --power-analysis.",
+    )
+    parser.add_argument(
+        "--alpha",
+        type=float,
+        default=0.05,
+        help="Significance level for power analysis (default: 0.05). Used with --power-analysis.",
+    )
+    parser.add_argument(
+        "--power",
+        type=float,
+        default=0.80,
+        help="Desired statistical power (default: 0.80). Used with --power-analysis.",
+    )
+    parser.add_argument(
+        "--correlation",
+        type=float,
+        default=0.5,
+        help="Expected correlation between paired samples (default: 0.5). Used with --power-analysis.",
+    )
+    parser.add_argument(
+        "--std-a",
+        type=float,
+        default=None,
+        help="Std deviation of model A scores (estimate from previous eval). Default: 0.5 for binary. Used with --power-analysis.",
+    )
+    parser.add_argument(
+        "--std-b",
+        type=float,
+        default=None,
+        help="Std deviation of model B scores (estimate from previous eval). If not set, assumes equal to --std-a. Used with --power-analysis.",
+    )
+
     args = parser.parse_args()
     return args
 
@@ -281,20 +439,17 @@ def parse_eval_args() -> argparse.Namespace:
 def cli_evaluate(args: Union[argparse.Namespace, None] = None) -> None:
     default_args = parse_eval_args()
 
-    if args is None and len(sys.argv) == 1:
-        print("┌───────────────────────────────────────────────────────────────────────────────┐")
-        print("│ Please provide arguments to evaluate the model. e.g.                          │")
-        print("│ `lmms-eval --model llava --model_path liuhaotian/llava-v1.6-7b --tasks okvqa` │")
-        print("│ Use `lmms-eval --help` for more information.                                  │")
-        print("└───────────────────────────────────────────────────────────────────────────────┘")
-        sys.exit(1)
-
     # If args were provided, override the defaults
     if args:
         for key, value in vars(args).items():
             setattr(default_args, key, value)
 
     args = default_args
+
+    # Handle power analysis mode (pre-evaluation planning)
+    if getattr(args, "power_analysis", False):
+        _run_power_analysis(args)
+        sys.exit(0)
 
     if args.wandb_args:
         if "name" not in args.wandb_args:
@@ -439,7 +594,7 @@ def cli_evaluate_single(args: Union[argparse.Namespace, None] = None) -> None:
         eval_logger.error("Need to specify task to evaluate.")
         sys.exit()
     elif args.tasks == "list":
-        eval_logger.info("Available Tasks:\n - {}".format(f"\n - ".join(sorted(task_manager.all_tasks))))
+        eval_logger.info("Available Tasks:\n - {}".format("\n - ".join(sorted(task_manager.all_tasks))))
         sys.exit()
     elif args.tasks == "list_groups":
         eval_logger.info(task_manager.list_all_tasks(list_subtasks=False, list_tags=False))
@@ -511,6 +666,8 @@ def cli_evaluate_single(args: Union[argparse.Namespace, None] = None) -> None:
         distributed_executor_backend="torchrun" if (torch.distributed.is_available() and torch.distributed.is_initialized()) else "accelerate",
         force_simple=args.force_simple,
         launcher_args=args.launcher_args,
+        num_samples=args.num_samples,
+        baseline=args.baseline,
         **request_caching_args,
     )
 
@@ -525,7 +682,11 @@ def cli_evaluate_single(args: Union[argparse.Namespace, None] = None) -> None:
 
         batch_sizes = ",".join(map(str, results["config"]["batch_sizes"]))
 
-        evaluation_tracker.save_results_aggregated(results=results, samples=samples if args.log_samples else None, datetime_str=datetime_str)
+        evaluation_tracker.save_results_aggregated(
+            results=results,
+            samples=samples if args.log_samples else None,
+            datetime_str=datetime_str,
+        )
 
         if args.log_samples:
             for task_name, config in results["configs"].items():
