@@ -28,17 +28,17 @@ from lmms_eval.api.registry import register_model
 
 warnings.filterwarnings("ignore")
 
-from fastvlm.constants import DEFAULT_IMAGE_TOKEN, IMAGE_TOKEN_INDEX
-from fastvlm.conversation import conv_templates
-from fastvlm.utils.checkpoint import load_pretrained_model
-from fastvlm.utils.ops import process_images, tokenizer_image_token
+from jingyu.constants import DEFAULT_IMAGE_TOKEN, IMAGE_TOKEN_INDEX
+from jingyu.conversation import conv_templates
+from jingyu.utils.checkpoint import load_pretrained_model
+from jingyu.utils.ops import process_images, tokenizer_image_token
 from loguru import logger as eval_logger
 
 torch.backends.cuda.matmul.allow_tf32 = True
 
 
-@register_model("fastvlm")
-class FastVLM(lmms):
+@register_model("jingyu")
+class Jingyu(lmms):
 
     def __init__(
         self,
