@@ -16,6 +16,7 @@ logger.add(sys.stdout, level="WARNING", format=log_format)
 AVAILABLE_SIMPLE_MODELS = {
     "aero": "Aero",
     "aria": "Aria",
+    "audio_flamingo_3": "AudioFlamingo3",
     "auroracap": "AuroraCap",
     "bagel": "Bagel",
     "bagel_umm": "BagelUMM",
@@ -39,6 +40,7 @@ AVAILABLE_SIMPLE_MODELS = {
     "internvl2": "InternVL2",
     "internvl3": "InternVL3",
     "internvl3_5": "InternVL3_5",
+    "kimi_audio": "KimiAudio",
     "llama_vid": "LLaMAVid",
     "llama_vision": "LlamaVision",
     "llava_hf": "LlavaHf",
@@ -93,6 +95,7 @@ AVAILABLE_SIMPLE_MODELS = {
 
 AVAILABLE_CHAT_TEMPLATE_MODELS = {
     "bagel_lmms_engine": "BagelLmmsEngine",
+    "internvl_hf": "InternVLHf",
     "llava_hf": "LlavaHf",
     "qwen3_vl": "Qwen3_VL",
     "qwen2_5_vl": "Qwen2_5_VL",
