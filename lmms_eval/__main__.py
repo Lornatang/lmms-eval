@@ -230,7 +230,13 @@ def parse_eval_args() -> argparse.Namespace:
         "--limit",
         type=float,
         default=None,
-        help="Limit the number of examples per task. " "If <1, limit is a percentage of the total number of examples.",
+        help=("Limit examples per task: use -1 (or omit) for all samples, " "0 < limit < 1 for a fraction of the dataset, and limit >= 1 " "for an absolute sample count."),
+    )
+    parser.add_argument(
+        "--offset",
+        type=int,
+        default=0,
+        help="Start evaluation from this dataset index for each task.",
     )
     parser.add_argument(
         "--use_cache",
@@ -238,7 +244,9 @@ def parse_eval_args() -> argparse.Namespace:
         type=str,
         default=None,
         metavar="DIR",
-        help="A path to a sqlite db file for caching model responses. `None` if not caching.",
+        help="Directory for response-level caching (SQLite + JSONL audit log). "
+        "Caches deterministic model responses (temperature=0) for reuse across runs. "
+        "Per-rank files created automatically for distributed safety. `None` to disable.",
     )
     parser.add_argument(
         "--cache_requests",
@@ -381,10 +389,12 @@ def parse_eval_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "-n",
+        "--repeats",
         "--num_samples",
+        dest="repeats",
         type=int,
         default=1,
-        help="Number of samples per question for model stability measurement. " "When n > 1, enables k-samples mode and computes EA, CA, IV, CR metrics.",
+        help=("Number of repeated generations per question for model stability " "measurement. Backward-compatible alias: --num_samples. " "When n > 1, enables k-samples " "mode and computes EA, CA, IV, CR metrics."),
     )
     parser.add_argument("--baseline", type=str, default=None, help="Baseline for paired t-test comparison. Accepts: local JSONL path, hf://user/repo, or preset name (e.g., qwen25vl).")
 
@@ -529,7 +539,7 @@ def cli_evaluate(args: Union[argparse.Namespace, None] = None) -> None:
     for args, results in zip(args_list, results_list):
         # cli_evaluate will return none if the process is not the main process (rank 0)
         if results is not None:
-            print(f"{args.model} ({args.model_args}), gen_kwargs: ({args.gen_kwargs}), limit: {args.limit}, num_fewshot: {args.num_fewshot}, " f"batch_size: {args.batch_size}")
+            print(f"{args.model} ({args.model_args}), gen_kwargs: ({args.gen_kwargs}), " f"limit: {args.limit}, offset: {args.offset}, num_fewshot: {args.num_fewshot}, " f"batch_size: {args.batch_size}")
             print(make_table(results))
             if "groups" in results:
                 print(make_table(results, "groups"))
@@ -581,8 +591,12 @@ def cli_evaluate_single(args: Union[argparse.Namespace, None] = None) -> None:
     if "push_samples_to_hub" in evaluation_tracker_args and not args.log_samples:
         eval_logger.warning("Pushing samples to the Hub requires --log_samples to be set. Samples will not be pushed to the Hub.")
 
-    if args.limit:
+    if args.limit is not None and args.limit != -1:
         eval_logger.warning(" --limit SHOULD ONLY BE USED FOR TESTING." "REAL METRICS SHOULD NOT BE COMPUTED USING LIMIT.")
+    if args.limit is not None and args.limit < 0 and args.limit != -1:
+        raise ValueError("--limit must be -1 or non-negative")
+    if args.offset < 0:
+        raise ValueError("--offset must be >= 0")
 
     if os.environ.get("LMMS_EVAL_PLUGINS", None):
         args.include_path = [args.include_path] if args.include_path else []
@@ -646,6 +660,7 @@ def cli_evaluate_single(args: Union[argparse.Namespace, None] = None) -> None:
         device=args.device,
         use_cache=args.use_cache,
         limit=args.limit,
+        offset=args.offset,
         check_integrity=args.check_integrity,
         write_out=args.write_out,
         log_samples=args.log_samples,
@@ -666,7 +681,7 @@ def cli_evaluate_single(args: Union[argparse.Namespace, None] = None) -> None:
         distributed_executor_backend="torchrun" if (torch.distributed.is_available() and torch.distributed.is_initialized()) else "accelerate",
         force_simple=args.force_simple,
         launcher_args=args.launcher_args,
-        num_samples=args.num_samples,
+        repeats=args.repeats,
         baseline=args.baseline,
         **request_caching_args,
     )
@@ -700,7 +715,7 @@ def cli_evaluate_single(args: Union[argparse.Namespace, None] = None) -> None:
 
 
 def print_results(args, results):
-    print(f"{args.model} ({args.model_args}),\ngen_kwargs: ({args.gen_kwargs}),\nlimit: {args.limit},\nnum_fewshot: {args.num_fewshot},\nbatch_size: {args.batch_size}")
+    print(f"{args.model} ({args.model_args}),\n" f"gen_kwargs: ({args.gen_kwargs}),\n" f"limit: {args.limit},\n" f"offset: {args.offset},\n" f"num_fewshot: {args.num_fewshot},\n" f"batch_size: {args.batch_size}")
     print(evaluator.make_table(results))
     if "groups" in results:
         print(evaluator.make_table(results, "groups"))

@@ -2,9 +2,7 @@
 <img src="https://i.postimg.cc/KvkLzbF9/WX20241212-014400-2x.png">
 </p>
 
-# The Evaluation Suite of Large Multimodal Models
-
-🌐 **English** | [简体中文](docs/i18n/README_zh-CN.md) | [繁體中文](docs/i18n/README_zh-TW.md) | [日本語](docs/i18n/README_ja.md) | [한국어](docs/i18n/README_ko.md) | [Español](docs/i18n/README_es.md) | [Français](docs/i18n/README_fr.md) | [Deutsch](docs/i18n/README_de.md) | [Português](docs/i18n/README_pt-BR.md) | [Русский](docs/i18n/README_ru.md) | [Italiano](docs/i18n/README_it.md) | [Nederlands](docs/i18n/README_nl.md) | [Polski](docs/i18n/README_pl.md) | [Türkçe](docs/i18n/README_tr.md) | [العربية](docs/i18n/README_ar.md) | [हिन्दी](docs/i18n/README_hi.md) | [Tiếng Việt](docs/i18n/README_vi.md) | [Indonesia](docs/i18n/README_id.md)
+# LMMs-Eval: Probing Intelligence in the Real World
 
 [![PyPI](https://img.shields.io/pypi/v/lmms-eval)](https://pypi.org/project/lmms-eval)
 ![PyPI - Downloads](https://img.shields.io/pypi/dm/lmms-eval)
@@ -12,19 +10,32 @@
 [![issue resolution](https://img.shields.io/github/issues-closed-raw/EvolvingLMMs-Lab/lmms-eval)](https://github.com/EvolvingLMMs-Lab/lmms-eval/issues)
 [![open issues](https://img.shields.io/github/issues-raw/EvolvingLMMs-Lab/lmms-eval)](https://github.com/EvolvingLMMs-Lab/lmms-eval/issues)
 
-> Accelerating the development of large multimodal models (LMMs) with `lmms-eval`. We support most text, image, video and audio tasks.
+> We are building the unified evaluation toolkit for frontier models and probing the abilities in real world, shape what we build next.
 
-🏠 [LMMs-Lab Homepage](https://www.lmms-lab.com/) | 🤗 [Huggingface Datasets](https://huggingface.co/lmms-lab) | <a href="https://emoji.gg/emoji/1684-discord-thread"><img src="https://cdn3.emoji.gg/emojis/1684-discord-thread.png" width="14px" height="14px" alt="Discord_Thread"></a> [discord/lmms-eval](https://discord.gg/zdkwKUqrPy)
+<details>
+<summary>🌐 Available in 17 languages</summary>
 
-📖 [Supported Tasks (100+)](https://github.com/EvolvingLMMs-Lab/lmms-eval/blob/main/docs/current_tasks.md) | 🌟 [Supported Models (30+)](https://github.com/EvolvingLMMs-Lab/lmms-eval/tree/main/lmms_eval/models) | 📚 [Documentation](docs/README.md)
+[简体中文](docs/i18n/README_zh-CN.md) | [繁體中文](docs/i18n/README_zh-TW.md) | [日本語](docs/i18n/README_ja.md) | [한국어](docs/i18n/README_ko.md) | [Español](docs/i18n/README_es.md) | [Français](docs/i18n/README_fr.md) | [Deutsch](docs/i18n/README_de.md) | [Português](docs/i18n/README_pt-BR.md) | [Русский](docs/i18n/README_ru.md) | [Italiano](docs/i18n/README_it.md) | [Nederlands](docs/i18n/README_nl.md) | [Polski](docs/i18n/README_pl.md) | [Türkçe](docs/i18n/README_tr.md) | [العربية](docs/i18n/README_ar.md) | [हिन्दी](docs/i18n/README_hi.md) | [Tiếng Việt](docs/i18n/README_vi.md) | [Indonesia](docs/i18n/README_id.md)
+
+</details>
+
+📚 [Documentation](docs/README.md) | 📖 [100+ Tasks](https://github.com/EvolvingLMMs-Lab/lmms-eval/blob/main/docs/current_tasks.md) | 🌟 [30+ Models](https://github.com/EvolvingLMMs-Lab/lmms-eval/tree/main/lmms_eval/models) | ⚡ [Quickstart](docs/quickstart.md)
+
+🏠 [Homepage](https://www.lmms-lab.com/) | 💬 [Discord](https://discord.gg/8xTM6jWnXa) | 🤝 [Contributing](CONTRIBUTING.md)
 
 ---
 
+## Why `lmms-eval`?
+
+We are on a journey toward Artificial General Intelligence, similar to the excitement of the moon landing era. This effort is driven by large language models and multimodal models that can understand and act across many kinds of tasks. To measure progress, we rely on benchmarks. But the ecosystem is fragmented. Datasets are scattered across different platforms, each with its own format, scripts, and post processing logic. Two teams evaluating the same model on the same benchmark often report different numbers. The difference often comes from evaluation details.
+
+Even with a unified pipeline, deeper problems remain. Existing open source evaluation toolkits are packaged as libraries, not as services that can be used in different scenarios (async eval call during training, or a job submission after training in standalone cluster). And scores are usually reported as a single accuracy number, representing only the mean from a statistical perspective. It is hard to tell whether a small gain is a true improvement without estimating variance and considering the number of samples in each benchmark. There are many more to be fixed and explored. [lmms-eval v0.6](docs/lmms-eval-0.6.md) is a small step towards better eval toolkit.
+
+We are keeping the evolving pace to build better evals, to explore evaluation's role on the path to frontier models. We believe [better evals lead to better models](https://arxiv.org/pdf/2211.09110): good evaluation maps the border of model capabilities and shapes what we build next. That is what it means to probe intelligence in the real world.
+
 ## What's New
 
-Evaluating multimodal models is harder than it looks. We have hundreds of benchmarks, but no standard way to run them. Results vary between labs. Comparisons become unreliable. We've been working to address this - not through heroic effort, but through systematic process.
-
-**January 2026** - We recognized that spatial and compositional reasoning remained blind spots in existing benchmarks. We added [CaptionQA](https://captionqa.github.io/), [SpatialTreeBench](https://github.com/THUNLP-MT/SpatialTreeBench), [SiteBench](https://sitebench.github.io/), and [ViewSpatial](https://github.com/ViewSpatial/ViewSpatial). For teams running remote evaluation pipelines, we introduced an HTTP eval server (#972). For those who need statistical rigor, we added CLT and clustered standard error estimation (#989).
+**February 2026 (v0.6)** - Our previous versions were too slow, the architecture wasn't clean, and the results lacked statistical insight. v0.6 is a re-engineered release that addresses all three: evaluation runs as a standalone service (decoupled from training, serving queue-based eval requests), statistically grounded results that capture real model improvements rather than a single accuracy score (confidence intervals, clustered standard errors, paired comparison with t-test), and optimizations to max out your model runtime's capacity (~7.5x over previous versions). 50+ new tasks and 10+ new models. [Release notes](docs/lmms-eval-0.6.md) | [Changelog](CHANGELOG.md).
 
 **October 2025 (v0.5)** - Audio had been a gap. Models could hear, but we had no consistent way to test them. This release added comprehensive audio evaluation, response caching for efficiency, and 50+ benchmark variants spanning audio, vision, and reasoning. [Release notes](https://github.com/EvolvingLMMs-Lab/lmms-eval/blob/main/docs/lmms-eval-0.5.md).
 
@@ -47,25 +58,28 @@ Evaluating multimodal models is harder than it looks. We have hundreds of benchm
 
 </details>
 
-## Why `lmms-eval`?
+## Quickstart
 
-We are in the middle of something that feels like the 1960s space race - except this time, the destination is artificial general intelligence. Large multimodal models are our rockets. They can see, hear, read, and reason. The progress is real and accelerating.
+Install and run your first evaluation in under 5 minutes:
 
-But here is the problem: our measurement systems have not kept pace with our ambitions.
+```bash
+git clone https://github.com/EvolvingLMMs-Lab/lmms-eval.git
+cd lmms-eval && uv pip install -e ".[all]"
 
-We have benchmarks - hundreds of them. But they are scattered across Google Drive folders, Dropbox links, university websites, and lab servers. Each benchmark has its own data format, its own evaluation script, its own quirks. When two teams report results on the same benchmark, they often get different numbers. Not because their models differ, but because their evaluation pipelines differ.
+# Run a quick evaluation (Qwen2.5-VL on MME, 8 samples)
+python -m lmms_eval \
+  --model qwen2_5_vl \
+  --model_args pretrained=Qwen/Qwen2.5-VL-3B-Instruct \
+  --tasks mme \
+  --batch_size 1 \
+  --limit 8
+```
 
-Imagine if, during the space race, every country measured distance in different units and never shared their conversion tables. That is roughly where we are today with multimodal evaluation.
-
-This is not a minor inconvenience. It is a systemic failure. Without consistent measurement, we cannot know which models are actually better. We cannot reproduce results. We cannot build on each other's work.
-
-For language models, this problem was largely solved by [lm-evaluation-harness](https://github.com/EleutherAI/lm-evaluation-harness). It provides unified data loading, standardized evaluation, and reproducible results. It powers the [Open LLM Leaderboard](https://huggingface.co/spaces/HuggingFaceH4/open_llm_leaderboard). It has become infrastructure.
-
-We built `lmms-eval` to do the same for multimodal models. Same principle: one framework, consistent interfaces, reproducible numbers. The moonshot needs a reliable ruler.
+If it prints metrics, your environment is ready. For the full guide, see [`docs/quickstart.md`](docs/quickstart.md).
 
 ## Installation
 
-### Using uv (Recommended for consistent environments)
+### Using `uv` (Recommended for consistent environments)
 
 We use `uv` for package management to ensure all developers use exactly the same package versions. First, install uv:
 ```bash
@@ -106,7 +120,7 @@ uv pip install git+https://github.com/EvolvingLMMs-Lab/lmms-eval.git
 <details>
 <summary>Reproduction of LLaVA-1.5's paper results</summary>
 
-You can check the [environment install script](miscs/repr_scripts.sh) and [torch environment info](miscs/repr_torch_envs.txt) to **reproduce LLaVA-1.5's paper results**. We found torch/cuda versions difference would cause small variations in the results, we provide the [results check](miscs/llava_result_check.md) with different environments.
+You can check the [torch environment info](miscs/repr_torch_envs.txt) and [results check](miscs/llava_result_check.md) to **reproduce LLaVA-1.5's paper results**. We found torch/cuda versions difference would cause small variations in the results.
 
 </details>
 
@@ -142,147 +156,6 @@ pip install s2wrapper@git+https://github.com/bfshi/scaling_on_scales
 
 Our Development will be continuing on the main branch, and we encourage you to give us feedback on what features are desired and how to improve the library further, or ask questions, either in issues or PRs on GitHub.
 
-## Web UI
-
-LMMS-Eval includes an optional Web UI for interactive evaluation configuration.
-
-### Requirements
-
-- Node.js 18+ (for building the frontend, auto-built on first run)
-
-### Usage
-
-```bash
-# Start the Web UI (opens browser automatically)
-uv run lmms-eval-ui
-
-# Custom port
-LMMS_SERVER_PORT=3000 uv run lmms-eval-ui
-```
-
-The web UI provides:
-- Model selection from all available models
-- Task selection with search/filter
-- Real-time command preview
-- Live evaluation output streaming
-- Start/Stop evaluation controls
-
-For more details, see [Web UI README](lmms_eval/tui/README.md).
-
-## HTTP Evaluation Server
-
-LMMS-Eval includes a production-ready HTTP server for remote evaluation workflows.
-
-### Why Use Eval Server?
-
-- **Decoupled evaluation**: Run evaluations on dedicated GPU nodes while training continues
-- **Async workflow**: Submit jobs without blocking training loops
-- **Queue management**: Sequential job processing with automatic resource management
-- **Remote access**: Evaluate models from any machine
-
-### Start Server
-
-```python
-from lmms_eval.entrypoints import ServerArgs, launch_server
-
-# Configure server
-args = ServerArgs(
-    host="0.0.0.0",
-    port=8000,
-    max_completed_jobs=200,
-    temp_dir_prefix="lmms_eval_"
-)
-
-# Launch server
-launch_server(args)
-```
-
-Server runs at `http://host:port` with auto-generated API docs at `/docs`
-
-### Client Usage
-
-**Sync Client:**
-```python
-from lmms_eval.entrypoints import EvalClient
-
-client = EvalClient("http://eval-server:8000")
-
-# Submit evaluation (non-blocking)
-job = client.evaluate(
-    model="qwen2_5_vl",
-    tasks=["mmmu_val", "mme"],
-    model_args={"pretrained": "Qwen/Qwen2.5-VL-7B-Instruct"},
-    num_fewshot=0,
-    batch_size=1,
-    device="cuda:0",
-)
-
-# Continue training...
-# Later, retrieve results
-result = client.wait_for_job(job["job_id"])
-print(result["result"])
-```
-
-**Async Client:**
-```python
-from lmms_eval.entrypoints import AsyncEvalClient
-
-async with AsyncEvalClient("http://eval-server:8000") as client:
-    job = await client.evaluate(
-        model="qwen3_vl",
-        tasks=["mmmu_val"],
-        model_args={"pretrained": "Qwen/Qwen3-VL-4B-Instruct"},
-    )
-    result = await client.wait_for_job(job["job_id"])
-```
-
-### Server API Endpoints
-
-| Endpoint | Method | Description |
-|----------|--------|-------------|
-| `/health` | GET | Server health check |
-| `/evaluate` | POST | Submit evaluation job |
-| `/jobs/{job_id}` | GET | Get job status and results |
-| `/queue` | GET | View queue status |
-| `/tasks` | GET | List available tasks |
-| `/models` | GET | List available models |
-| `/jobs/{job_id}` | DELETE | Cancel queued job |
-| `/merge` | POST | Merge FSDP2 sharded checkpoints |
-
-### Example Workflow
-
-```python
-# Training loop pseudocode
-for epoch in range(num_epochs):
-    train_one_epoch()
-
-    # After every N epochs, evaluate checkpoint
-    if epoch % 5 == 0:
-        checkpoint_path = f"checkpoints/epoch_{epoch}"
-
-        # Submit async evaluation (non-blocking)
-        eval_job = client.evaluate(
-            model="vllm",
-            model_args={"model": checkpoint_path},
-            tasks=["mmmu_val", "mathvista"],
-        )
-
-        # Training continues immediately
-        print(f"Evaluation job submitted: {eval_job['job_id']}")
-
-# After training completes, retrieve all results
-results = []
-for job_id in eval_jobs:
-    result = client.wait_for_job(job_id)
-    results.append(result)
-```
-
-### Security Note
-
-⚠️ **This server is intended for trusted environments only**. Do NOT expose to untrusted networks without additional security layers (authentication, rate limiting, network isolation).
-
-For more details, see the [v0.6 release notes](docs/lmms-eval-0.6.md).
-
 ## Usage Examples
 
 > More examples can be found in [examples/models](examples/models)
@@ -299,10 +172,20 @@ bash examples/models/vllm_qwen2vl.sh
 bash examples/models/vllm_qwen3vl.sh
 ```
 
+**Qwen3.5:**
+```bash
+bash examples/models/vllm_qwen35.sh
+```
+
 ### Evaluation with SGLang
 
 ```bash
 bash examples/models/sglang.sh
+```
+
+**Qwen3.5:**
+```bash
+bash examples/models/sglang_qwen35.sh
 ```
 
 ### Evaluation of OpenAI-Compatible Model
@@ -502,6 +385,197 @@ metric_list:
 
 For more details, see the [Task Guide](docs/task_guide.md).
 
+## Web UI
+
+LMMS-Eval includes an optional Web UI for interactive evaluation configuration.
+
+### Requirements
+
+- Node.js 18+ (for building the frontend, auto-built on first run)
+
+### Usage
+
+```bash
+# Start the Web UI (opens browser automatically)
+uv run lmms-eval-ui
+
+# Custom port
+LMMS_SERVER_PORT=3000 uv run lmms-eval-ui
+```
+
+The web UI provides:
+- Model selection from all available models
+- Task selection with search/filter
+- Real-time command preview
+- Live evaluation output streaming
+- Start/Stop evaluation controls
+
+For more details, see [Web UI README](lmms_eval/tui/README.md).
+
+## HTTP Evaluation Server
+
+LMMS-Eval includes a production-ready HTTP server for remote evaluation workflows.
+
+### Why Use Eval Server?
+
+- **Decoupled evaluation**: Run evaluations on dedicated GPU nodes while training continues
+- **Async workflow**: Submit jobs without blocking training loops
+- **Queue management**: Sequential job processing with automatic resource management
+- **Remote access**: Evaluate models from any machine
+
+### Start Server
+
+```python
+from lmms_eval.entrypoints import ServerArgs, launch_server
+
+# Configure server
+args = ServerArgs(
+    host="0.0.0.0",
+    port=8000,
+    max_completed_jobs=200,
+    temp_dir_prefix="lmms_eval_"
+)
+
+# Launch server
+launch_server(args)
+```
+
+Server runs at `http://host:port` with auto-generated API docs at `/docs`
+
+### Client Usage
+
+**Sync Client:**
+```python
+from lmms_eval.entrypoints import EvalClient
+
+client = EvalClient("http://eval-server:8000")
+
+# Submit evaluation (non-blocking)
+job = client.evaluate(
+    model="qwen2_5_vl",
+    tasks=["mmmu_val", "mme"],
+    model_args={"pretrained": "Qwen/Qwen2.5-VL-7B-Instruct"},
+    num_fewshot=0,
+    batch_size=1,
+    device="cuda:0",
+)
+
+# Continue training...
+# Later, retrieve results
+result = client.wait_for_job(job["job_id"])
+print(result["result"])
+```
+
+**Async Client:**
+```python
+from lmms_eval.entrypoints import AsyncEvalClient
+
+async with AsyncEvalClient("http://eval-server:8000") as client:
+    job = await client.evaluate(
+        model="qwen3_vl",
+        tasks=["mmmu_val"],
+        model_args={"pretrained": "Qwen/Qwen3-VL-4B-Instruct"},
+    )
+    result = await client.wait_for_job(job["job_id"])
+```
+
+### Server API Endpoints
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/health` | GET | Server health check |
+| `/evaluate` | POST | Submit evaluation job |
+| `/jobs/{job_id}` | GET | Get job status and results |
+| `/queue` | GET | View queue status |
+| `/tasks` | GET | List available tasks |
+| `/models` | GET | List available models |
+| `/jobs/{job_id}` | DELETE | Cancel queued job |
+| `/merge` | POST | Merge FSDP2 sharded checkpoints |
+
+### Example Workflow
+
+```python
+# Training loop pseudocode
+for epoch in range(num_epochs):
+    train_one_epoch()
+
+    # After every N epochs, evaluate checkpoint
+    if epoch % 5 == 0:
+        checkpoint_path = f"checkpoints/epoch_{epoch}"
+
+        # Submit async evaluation (non-blocking)
+        eval_job = client.evaluate(
+            model="vllm",
+            model_args={"model": checkpoint_path},
+            tasks=["mmmu_val", "mathvista"],
+        )
+
+        # Training continues immediately
+        print(f"Evaluation job submitted: {eval_job['job_id']}")
+
+# After training completes, retrieve all results
+results = []
+for job_id in eval_jobs:
+    result = client.wait_for_job(job_id)
+    results.append(result)
+```
+
+### Security Note
+
+⚠️ **This server is intended for trusted environments only**. Do NOT expose to untrusted networks without additional security layers (authentication, rate limiting, network isolation).
+
+For more details, see the [v0.6 release notes](docs/lmms-eval-0.6.md).
+
+## Frequently Asked Questions
+
+<details>
+<summary><strong>What models does lmms-eval support?</strong></summary>
+
+We support 30+ model families out of the box, including Qwen2.5-VL, Qwen3-VL, LLaVA-OneVision, InternVL-2, VILA, and more. Any OpenAI-compatible API endpoint is also supported. See the full list in [`lmms_eval/models/`](lmms_eval/models/).
+
+Qwen3.5 is supported through existing runtime backends (`--model vllm` and `--model sglang`) by setting `model=Qwen/Qwen3.5-397B-A17B` in `--model_args`.
+
+The Qwen3.5 example scripts align with official runtime references (for example, `max_model_len/context_length=262144` and `reasoning_parser=qwen3`).
+
+If a new model family is already fully supported by vLLM or SGLang at runtime, we generally only need documentation and examples instead of adding a dedicated model wrapper.
+
+</details>
+
+<details>
+<summary><strong>What benchmarks and tasks are available?</strong></summary>
+
+Over 100 evaluation tasks across image, video, and audio modalities, including MMMU, MME, MMBench, MathVista, VideoMME, EgoSchema, and many more. Check [`docs/current_tasks.md`](docs/current_tasks.md) for the full list.
+
+</details>
+
+<details>
+<summary><strong>How do I add my own benchmark?</strong></summary>
+
+Create a YAML config under `lmms_eval/tasks/` with dataset path, splits, and a `doc_to_messages` function. See [`docs/task_guide.md`](docs/task_guide.md) for a step-by-step guide.
+
+</details>
+
+<details>
+<summary><strong>Can I evaluate a model behind an API (e.g., GPT-4o, Claude)?</strong></summary>
+
+Yes. Use `--model openai` with `--model_args model=gpt-4o` and set `OPENAI_API_KEY`. Any OpenAI-compatible endpoint works, including local vLLM/SGLang servers.
+
+</details>
+
+<details>
+<summary><strong>How do I run evaluations on multiple GPUs?</strong></summary>
+
+Use `accelerate launch` or pass `--device cuda` with tensor parallelism via vLLM/SGLang backends. See [`docs/commands.md`](docs/commands.md) for multi-GPU flags.
+
+</details>
+
+<details>
+<summary><strong>How do I cite lmms-eval?</strong></summary>
+
+Use the BibTeX entries below, or click the "Cite this repository" button in the GitHub sidebar (powered by our [`CITATION.cff`](CITATION.cff)).
+
+</details>
+
 ## Acknowledgement
 
 lmms_eval is a fork of [lm-eval-harness](https://github.com/EleutherAI/lm-evaluation-harness). We recommend you to read through the [docs of lm-eval-harness](https://github.com/EleutherAI/lm-evaluation-harness/tree/main/docs) for relevant information.
@@ -517,7 +591,7 @@ Below are the changes we made to the original API:
 
 ## Citations
 
-```shell
+```bibtex
 @misc{zhang2024lmmsevalrealitycheckevaluation,
       title={LMMs-Eval: Reality Check on the Evaluation of Large Multimodal Models},
       author={Kaichen Zhang and Bo Li and Peiyuan Zhang and Fanyi Pu and Joshua Adrian Cahyono and Kairui Hu and Shuai Liu and Yuanhan Zhang and Jingkang Yang and Chunyuan Li and Ziwei Liu},

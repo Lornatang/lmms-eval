@@ -7,7 +7,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "lmms_eval"
-version = "0.5.0"
+version = "0.6.1"
 authors = [
     { name = "LMMMs-Lab Evaluation Team", email = "lmms-lab@outlook.com" },
 ]
@@ -19,7 +19,7 @@ classifiers = [
     "Programming Language :: Python :: 3",
     "Operating System :: OS Independent",
 ]
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 dependencies = [
     "accelerate>=0.29.1",
     "black>=24.1.0",
@@ -36,7 +36,6 @@ dependencies = [
     "pytablewriter",
     "sacrebleu>=1.5.0",
     "scikit-learn>=0.24.1",
-    "sqlitedict>=2.1.0",
     "torch>=2.1.0", # to enable sdpa mode for running 34B model on one 80GB GPU
     "torchvision>=0.16.0",
     "timm",
@@ -123,6 +122,10 @@ mmsearch = [
     "beautifulsoup4",
     "FlagEmbedding",
     "rouge",
+]
+prismmbench = [
+    "pdf2image>=1.17.0",
+    "pdfplumber>=0.11.9"
 ]
 tui = [
     "fastapi>=0.100.0",

@@ -17,6 +17,7 @@ Majority of this documentation is adapted from [lm-eval-harness](https://github.
 ## Table of Contents
 
 * **[Commands Guide](commands.md)** - Learn about command line flags and options
+* **[Quick Start](quickstart.md)** - Evaluate your model in 5 minutes
 * **[Model Guide](model_guide.md)** - How to add and integrate new models
 * **[Task Guide](task_guide.md)** - Create custom evaluation tasks
 * **[Current Tasks](current_tasks.md)** - List of all supported evaluation tasks
@@ -24,6 +25,7 @@ Majority of this documentation is adapted from [lm-eval-harness](https://github.
 * **[Caching](caching.md)** - Enable and reload results from the JSONL cache
 * **[Version 0.3 Features](lmms-eval-0.3.md)** - Audio evaluation and new features
 * **[Throughput Metrics](throughput_metrics.md)** - Understanding performance metrics
+* **[MMMU Eval Discrepancy Analysis](mmmu-eval-discrepancy.md)** - Why lmms-eval and VLMEvalKit can report different MMMU scores
 
 ## Additional Resources
 

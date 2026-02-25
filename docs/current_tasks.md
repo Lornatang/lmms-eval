@@ -24,11 +24,11 @@ python -m lmms_eval --tasks list_with_num
 | Video Understanding | 25+ |
 | Long Video & Temporal | 10+ |
 | Audio & Speech | 20+ |
-| Document Understanding | 12+ |
+| Document Understanding | 19+ |
 | Mathematical Reasoning | 12+ |
 | Spatial & Grounding | 10+ |
 | Text-only Language Tasks | 15+ |
-| **Total** | **190+** |
+| **Total** | **197+** |
 
 ---
 
@@ -396,6 +396,14 @@ python -m lmms_eval --tasks list_with_num
   - Infographic VQA Test (infovqa_test)
 - [OCRBench](https://github.com/Yuliang-Liu/MultimodalOCR) (ocrbench)
 - [OCRBench v2](https://github.com/Yuliang-Liu/MultimodalOCR) (ocrbench_v2)
+- [PRISMM-Bench](https://arxiv.org/abs/2510.16505) (prismm_bench)
+  - PRISMM-Bench Identification (prismm_bench_identification)
+  - PRISMM-Bench Identification Whole Page Context (prismm_bench_identification_whole_page)
+  - PRISMM-Bench Identification Whole Document Context (prismm_bench_identification_whole_doc)
+  - PRISMM-Bench Remedy (prismm_bench_remedy)
+  - PRISMM-Bench Remedy Whole Page Context (prismm_bench_remedy_whole_page)
+  - PRISMM-Bench Remedy Whole Document Context(prismm_bench_remedy_whole_doc)
+  - PRISMM-Bench Pair Match (prismm_bench_pair_match)
 - [ScreenSpot](https://github.com/njucckevin/SeeClick) (screenspot)
   - ScreenSpot REC / Grounding (screenspot_rec)
   - ScreenSpot REG / Instruction Generation (screenspot_reg)
@@ -514,8 +522,8 @@ python -m lmms_eval --tasks list_with_num
 | `vllm_generate` | VLLMGenerate | vLLM generation mode |
 | `sglang` | Sglang | SGLang serving backend |
 | `huggingface` | Huggingface | Generic HuggingFace models |
-| `openai_compatible` | OpenAICompatible | OpenAI-compatible APIs |
-| `async_openai` | AsyncOpenAIChat | Async OpenAI chat |
+| `openai` | OpenAICompatible | OpenAI-compatible APIs (aliases: `openai_compatible`, `openai_compatible_chat`) |
+| `async_openai` | AsyncOpenAIChat | Async OpenAI chat (alias: `async_openai_compatible_chat`) |
 
 ### Simple/Legacy Models
 | Model Name | Class | Modality |
