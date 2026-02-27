@@ -52,7 +52,7 @@ class JingyuVL(lmms):
         conv_template="qwen",
         use_cache=True,
         tie_weights: bool = True,
-        truncate_context=False,  # whether to truncate the context in generation, set it False for LLaVA-1.6
+        truncate_context=False,
         customized_config=None,  # ends in json
         **kwargs,
     ) -> None:
@@ -93,7 +93,6 @@ class JingyuVL(lmms):
         self.conv_template = conv_template
         self.use_cache = use_cache
         self.truncate_context = truncate_context
-        # assert self.batch_size_per_gpu == 1, "Llava currently does not support batched generation. See https://github.com/haotian-liu/LLaVA/issues/754. HF Llava also has this issue."
         if accelerator.num_processes > 1:
             assert accelerator.distributed_type in [
                 DistributedType.FSDP,
@@ -373,7 +372,6 @@ class JingyuVL(lmms):
             pad_token_ids = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else self.tokenizer.eos_token_id
             input_ids = self.pad_sequence(input_ids_list, batch_first=True, padding_value=pad_token_ids).to(self.device)
             attention_masks = input_ids.ne(pad_token_ids).to(self.device)
-            # These steps are not in LLaVA's original code, but are necessary for generation to work
             # TODO: attention to this major generation step...
             try:
                 cont = self.model.generate(
@@ -418,4 +416,4 @@ class JingyuVL(lmms):
         return res
 
     def generate_until_multi_round(self, requests) -> List[str]:
-        raise NotImplementedError("TODO: Implement multi-round generation for LLaVA")
+        raise NotImplementedError("TODO: Implement multi-round generation for Jingyu-VL")
