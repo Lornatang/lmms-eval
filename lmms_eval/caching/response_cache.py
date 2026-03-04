@@ -1,13 +1,22 @@
 """Unified response-level cache for lmms-eval.
 
 SQLite primary store (WAL mode) + JSONL write-ahead audit log.
-Per-rank files for distributed safety. Caches only deterministic requests.
+Caches only deterministic requests (temperature=0, do_sample=False).
 Write order: JSONL append+fsync -> SQLite upsert (crash-safe).
 
-Activation: ``python -m lmms_eval --model ... --tasks ... --use_cache ./eval_cache``
+Activation::
 
-Cache key: sha256(request_type, task_name, doc_id, idx, canonical gen_kwargs).
-Scoped per model: ``{use_cache}/{model_hash}/rank{N}.db``
+    python -m lmms_eval --model ... --tasks ... --use_cache ./my_cache.db
+
+Cache key: sha256(request_type, task_name, doc_id, idx, canonical gen_kwargs, content_hash, task_fingerprint, model_fingerprint_hash).
+
+File layout:
+    Single GPU, local disk   - writes directly to the user-specified .db file.
+    Multi-GPU, local disk    - each rank writes to a temporary shard
+                               (``<target>.shard.<rank>``); rank 0 merges after eval.
+    Remote target (NFS/CIFS) - two-tier mode: writes go to local scratch (NVMe/SSD),
+                               reads check local first then shared DB on NFS.
+                               After eval, local writes merge back to NFS target.
 """
 
 import hashlib
@@ -16,12 +25,13 @@ import json
 import os
 import sqlite3
 import time
+import urllib.parse
 from functools import partial
 from typing import Any, Dict, List, Optional, Union
 
 from loguru import logger as eval_logger
 
-from lmms_eval.api.instance import Instance
+from lmms_eval.api.instance import GenerationResult, Instance
 
 CACHE_RELEVANT_KEYS = frozenset(
     {
@@ -40,7 +50,14 @@ CACHE_RELEVANT_KEYS = frozenset(
     }
 )
 
-_SCHEMA_VERSION = 1
+_SCHEMA_VERSION = 3
+
+
+def _short_hash(value: str) -> str:
+    if not value:
+        return ""
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()[:16]
+
 
 _SCHEMA_SQL = """\
 CREATE TABLE IF NOT EXISTS responses (
@@ -164,12 +181,14 @@ def fingerprint_callable(fn) -> str:
 
 
 def _extract_content_hash(instance: Instance) -> str:
-    """Hash the text content of loglikelihood args to prevent collisions.
+    """Hash leading text arguments to prevent cache-key collisions.
 
-    For multiple_choice with acc_mutual_info, conditional requests have
-    ``(ctx, continuation, ...)`` while unconditional have ``("", choice)``.
-    Both share the same (task_name, doc_id, idx) so we need this hash
-    to distinguish them.
+    Some flows can issue multiple deterministic requests that share the same
+    ``(task_name, doc_id, idx, gen_kwargs)`` while differing in prompt text.
+    This is common in multi-round / agentic generation loops.
+
+    We hash the leading consecutive string arguments (for example context and
+    continuation) so those requests do not alias to the same cache entry.
     """
     args = instance.args
     text_parts = []
@@ -192,6 +211,8 @@ def compute_cache_key(
     idx: int = 0,
     task_fingerprint: str = "",
     content_hash: str = "",
+    model_fingerprint_hash: str = "",
+    eval_version: str = "",
 ) -> str:
     """Deterministic SHA-256 cache key for a model response.
 
@@ -199,6 +220,8 @@ def compute_cache_key(
     ``content_hash`` distinguishes conditional vs unconditional loglikelihood
     requests that share the same (task_name, doc_id, idx).
     ``task_fingerprint`` enables automatic invalidation on YAML/prompt changes.
+    ``model_fingerprint_hash`` ensures key-level model adapter isolation.
+    ``eval_version`` isolates cache entries across lmms-eval releases.
     """
     payload = {
         "v": _SCHEMA_VERSION,
@@ -212,6 +235,10 @@ def compute_cache_key(
         payload["ch"] = content_hash
     if task_fingerprint:
         payload["tf"] = task_fingerprint
+    if model_fingerprint_hash:
+        payload["mfh"] = model_fingerprint_hash
+    if eval_version:
+        payload["ev"] = eval_version
     data = json.dumps(payload, sort_keys=True, ensure_ascii=True, separators=(",", ":"))
     return hashlib.sha256(data.encode("utf-8")).hexdigest()
 
@@ -231,16 +258,32 @@ def _deserialize_response(stored: str) -> Any:
 class ResponseCache:
     """Unified response cache: SQLite (lookup) + JSONL (crash recovery).
 
+    Supports an optional **shared read-only DB** for two-tier caching.
+    When ``shared_db_path`` is provided, lookups check the local (writable)
+    DB first, then fall back to the shared DB.  All writes go exclusively
+    to the local DB.  This enables a pattern where the shared DB lives on
+    NFS (slow writes, fast reads) while the local DB lives on NVMe.
+
     Write path: JSONL append+fsync -> SQLite upsert.
     On startup: replays JSONL tail into SQLite to recover incomplete writes.
     Skips caching for non-deterministic requests and error/empty responses.
     """
 
-    def __init__(self, db_path: str, audit_path: str, model_fingerprint: str = "", task_fingerprints: Optional[Dict[str, str]] = None):
+    def __init__(
+        self,
+        db_path: str,
+        audit_path: str,
+        model_fingerprint: str = "",
+        task_fingerprints: Optional[Dict[str, str]] = None,
+        shared_db_path: Optional[str] = None,
+        eval_version: str = "",
+    ):
         self.db_path = db_path
         self.audit_path = audit_path
         self.model_fingerprint = model_fingerprint
+        self._model_fingerprint_hash = _short_hash(model_fingerprint)
         self._task_fingerprints: Dict[str, str] = task_fingerprints or {}
+        self._eval_version = eval_version
 
         self.db = sqlite3.connect(db_path, timeout=30)
         self.db.execute("PRAGMA journal_mode=WAL")
@@ -249,13 +292,35 @@ class ResponseCache:
 
         if model_fingerprint:
             self.db.execute("INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)", ("model_fingerprint", model_fingerprint))
-            self.db.execute("INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)", ("schema_version", str(_SCHEMA_VERSION)))
-            self.db.commit()
+        if self._model_fingerprint_hash:
+            self.db.execute("INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)", ("model_fingerprint_hash", self._model_fingerprint_hash))
+        self.db.execute("INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)", ("schema_version", str(_SCHEMA_VERSION)))
+        if eval_version:
+            # Warn if DB was written by a different lmms-eval version
+            row = self.db.execute("SELECT value FROM meta WHERE key = 'eval_version'").fetchone()
+            if row and row[0] != eval_version:
+                eval_logger.warning(f"ResponseCache: DB was last written by lmms-eval {row[0]}, " f"current version is {eval_version}. Cache keys now include version \u2014 " f"old entries will not match (safe, but no reuse).")
+            self.db.execute("INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)", ("eval_version", eval_version))
+        self.db.commit()
+
+        # Optional shared (read-only) DB for two-tier caching.
+        self._shared_db: Optional[sqlite3.Connection] = None
+        self._shared_db_path = shared_db_path
+        if shared_db_path and os.path.exists(shared_db_path):
+            try:
+                encoded_path = urllib.parse.quote(str(shared_db_path), safe="/")
+                self._shared_db = sqlite3.connect(f"file:{encoded_path}?mode=ro&immutable=1", uri=True, timeout=10)
+                shared_count = self._shared_db.execute("SELECT COUNT(*) FROM responses").fetchone()[0]
+                eval_logger.info(f"ResponseCache: shared DB loaded ({shared_count} entries): {shared_db_path}")
+            except Exception as e:
+                eval_logger.warning(f"ResponseCache: failed to open shared DB {shared_db_path}: {e}")
+                self._shared_db = None
 
         self._replay_audit_log()
         self._audit_file = open(audit_path, "a", encoding="utf-8")
 
         self._hits = 0
+        self._hits_shared = 0
         self._misses = 0
         self._skipped = 0
 
@@ -291,13 +356,39 @@ class ResponseCache:
             eval_logger.warning(f"ResponseCache: audit log replay failed: {e}")
 
     def _lookup(self, cache_key: str) -> Any:
+        """Look up a cache key: local DB first, then shared DB."""
+        # 1. Check local (writable) DB
         cur = self.db.execute("SELECT response FROM responses WHERE cache_key = ?", (cache_key,))
         row = cur.fetchone()
-        if row is None:
-            return None
-        return _deserialize_response(row[0])
+        if row is not None:
+            return _deserialize_response(row[0])
+        # 2. Fall back to shared (read-only) DB
+        if self._shared_db is not None:
+            try:
+                cur = self._shared_db.execute("SELECT response FROM responses WHERE cache_key = ?", (cache_key,))
+                row = cur.fetchone()
+                if row is not None:
+                    self._hits_shared += 1
+                    return _deserialize_response(row[0])
+            except Exception:
+                pass  # shared DB failure is non-fatal
+        return None
 
-    def _log_to_audit(self, request_type: str, task_name: str, doc_id: Union[int, str], idx: int, gen_kwargs: dict, response: Any, *, cache_key: str = "", deterministic: bool = True) -> None:
+    def _log_to_audit(
+        self,
+        request_type: str,
+        task_name: str,
+        doc_id: Union[int, str],
+        idx: int,
+        gen_kwargs: dict,
+        response: Any,
+        *,
+        cache_key: str = "",
+        deterministic: bool = True,
+        task_fingerprint: str = "",
+        content_hash: str = "",
+        model_fingerprint_hash: str = "",
+    ) -> None:
         """Append every response to the JSONL audit log regardless of determinism.
 
         This provides real-time observability (``tail -f``) for ALL model responses,
@@ -306,6 +397,7 @@ class ResponseCache:
         now = time.time()
         record = {
             "cache_key": cache_key,
+            "fingerprint_schema_version": _SCHEMA_VERSION,
             "request_type": request_type,
             "task_name": task_name,
             "doc_id": doc_id,
@@ -315,6 +407,14 @@ class ResponseCache:
             "created_at": now,
             "deterministic": deterministic,
         }
+        if task_fingerprint:
+            record["task_fingerprint"] = task_fingerprint
+        if content_hash:
+            record["content_hash"] = content_hash
+        if model_fingerprint_hash:
+            record["model_fingerprint_hash"] = model_fingerprint_hash
+        if self._eval_version:
+            record["eval_version"] = self._eval_version
         self._audit_file.write(json.dumps(record, ensure_ascii=False) + "\n")
         self._audit_file.flush()
         os.fsync(self._audit_file.fileno())
@@ -332,10 +432,22 @@ class ResponseCache:
         self.db.commit()
 
     @staticmethod
+    def _extract_cacheable(response: Any) -> Any:
+        """Extract the cache-safe payload from a model response.
+
+        ``GenerationResult`` objects are reduced to their ``.text`` so that the
+        cache stores only plain strings (token counts are ephemeral).
+        """
+        if isinstance(response, GenerationResult):
+            return response.text
+        return response
+
+    @staticmethod
     def _is_valid_response(response: Any, request_type: str) -> bool:
-        """Reject None, empty strings, and malformed loglikelihood tuples to prevent cache poisoning."""
         if response is None:
             return False
+        if isinstance(response, GenerationResult):
+            return bool(response.text and response.text.strip())
         if request_type == "loglikelihood":
             return isinstance(response, (list, tuple)) and len(response) == 2
         if isinstance(response, str) and response.strip() == "":
@@ -363,7 +475,7 @@ class ResponseCache:
                 self._skipped += 1
                 continue
 
-            ch = _extract_content_hash(req) if reqtype == "loglikelihood" else ""
+            ch = _extract_content_hash(req)
             tf = self._task_fingerprints.get(req.task_name, "")
             cache_key = compute_cache_key(
                 request_type=reqtype,
@@ -373,6 +485,8 @@ class ResponseCache:
                 idx=req.idx,
                 content_hash=ch,
                 task_fingerprint=tf,
+                model_fingerprint_hash=self._model_fingerprint_hash,
+                eval_version=self._eval_version,
             )
             cached = self._lookup(cache_key)
             if cached is not None:
@@ -391,14 +505,41 @@ class ResponseCache:
             new_resps = getattr(lm, reqtype)(uncached)
             for idx_pos, req, resp in zip(uncached_indices, uncached, new_resps):
                 results[idx_pos] = resp
+                cacheable = self._extract_cacheable(resp)
                 gen_kwargs = extract_gen_kwargs(req)
                 deterministic = is_deterministic(reqtype, gen_kwargs)
-                ch = _extract_content_hash(req) if reqtype == "loglikelihood" else ""
+                ch = _extract_content_hash(req)
                 tf = self._task_fingerprints.get(req.task_name, "")
-                cache_key = compute_cache_key(request_type=reqtype, task_name=req.task_name, doc_id=req.doc_id, gen_kwargs=gen_kwargs, idx=req.idx, content_hash=ch, task_fingerprint=tf) if deterministic else ""
-                self._log_to_audit(reqtype, req.task_name, req.doc_id, req.idx, gen_kwargs, resp, cache_key=cache_key, deterministic=deterministic)
+                cache_key = (
+                    compute_cache_key(
+                        request_type=reqtype,
+                        task_name=req.task_name,
+                        doc_id=req.doc_id,
+                        gen_kwargs=gen_kwargs,
+                        idx=req.idx,
+                        content_hash=ch,
+                        task_fingerprint=tf,
+                        model_fingerprint_hash=self._model_fingerprint_hash,
+                        eval_version=self._eval_version,
+                    )
+                    if deterministic
+                    else ""
+                )
+                self._log_to_audit(
+                    reqtype,
+                    req.task_name,
+                    req.doc_id,
+                    req.idx,
+                    gen_kwargs,
+                    cacheable,
+                    cache_key=cache_key,
+                    deterministic=deterministic,
+                    task_fingerprint=tf,
+                    content_hash=ch,
+                    model_fingerprint_hash=self._model_fingerprint_hash,
+                )
                 if deterministic and self._is_valid_response(resp, reqtype):
-                    self._store(cache_key, reqtype, req.task_name, req.doc_id, req.idx, gen_kwargs, resp)
+                    self._store(cache_key, reqtype, req.task_name, req.doc_id, req.idx, gen_kwargs, cacheable)
         else:
             eval_logger.info(f"ResponseCache: all {len(requests)} requests served from cache — skipping model inference")
 
@@ -406,13 +547,20 @@ class ResponseCache:
 
     def get_stats(self) -> Dict[str, Any]:
         total_lookups = self._hits + self._misses
-        return {
+        stats = {
             "hits": self._hits,
+            "hits_shared": self._hits_shared,
             "misses": self._misses,
             "skipped_non_deterministic": self._skipped,
             "hit_rate": self._hits / max(1, total_lookups),
             "total_cached_entries": self.db.execute("SELECT COUNT(*) FROM responses").fetchone()[0],
         }
+        if self._shared_db is not None:
+            try:
+                stats["shared_cached_entries"] = self._shared_db.execute("SELECT COUNT(*) FROM responses").fetchone()[0]
+            except Exception:
+                stats["shared_cached_entries"] = "unavailable"
+        return stats
 
     def close(self) -> None:
         try:
@@ -425,6 +573,12 @@ class ResponseCache:
                 self.db.close()
         except Exception:
             pass
+        try:
+            if self._shared_db:
+                self._shared_db.close()
+                self._shared_db = None
+        except Exception:
+            pass
 
     def __del__(self):
         try:
@@ -433,12 +587,15 @@ class ResponseCache:
             pass
 
     @staticmethod
-    def merge_shards(shard_paths: List[str], output_path: str) -> None:
-        """Merge per-rank SQLite shards into a consolidated DB (INSERT OR IGNORE)."""
-        if os.path.exists(output_path):
-            os.remove(output_path)
+    def merge_shards(shard_paths: List[str], output_path: str) -> int:
+        """Merge per-rank SQLite shards into a consolidated DB.
 
-        out_db = sqlite3.connect(output_path)
+        Uses INSERT OR IGNORE so existing entries in ``output_path`` are preserved.
+        Creates ``output_path`` if it does not exist.
+
+        Returns the number of entries inserted.
+        """
+        out_db = sqlite3.connect(output_path, timeout=30)
         out_db.execute("PRAGMA journal_mode=WAL")
         out_db.executescript(_SCHEMA_SQL)
 
@@ -457,8 +614,93 @@ class ResponseCache:
                     total += 1
                 except sqlite3.IntegrityError:
                     pass
+            # Copy meta table entries (model_fingerprint, schema_version, etc.)
+            meta_rows = shard_db.execute("SELECT key, value FROM meta").fetchall()
+            for key, value in meta_rows:
+                out_db.execute("INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)", (key, value))
             shard_db.close()
 
         out_db.commit()
         out_db.close()
-        eval_logger.info(f"ResponseCache: merged {total} entries from {len(shard_paths)} shards into {output_path}")
+        return total
+
+    @staticmethod
+    def merge_audit_logs(audit_paths: List[str], output_path: str) -> int:
+        """Merge per-rank JSONL audit logs into a single file.
+
+        Appends entries from all ``audit_paths`` into ``output_path``,
+        sorted by ``created_at`` timestamp.  Deduplicates by ``cache_key``
+        for deterministic entries; non-deterministic entries are always kept.
+
+        Returns the number of lines written.
+        """
+        entries: list = []
+        seen_keys: set = set()
+        for path in audit_paths:
+            if not os.path.exists(path):
+                continue
+            with open(path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        rec = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    # Deduplicate deterministic entries by cache_key
+                    ck = rec.get("cache_key", "")
+                    if ck and rec.get("deterministic", True):
+                        if ck in seen_keys:
+                            continue
+                        seen_keys.add(ck)
+                    entries.append(rec)
+
+        # Sort by created_at for chronological ordering
+        entries.sort(key=lambda r: r.get("created_at", 0))
+
+        written = 0
+        with open(output_path, "a", encoding="utf-8") as out:
+            for rec in entries:
+                out.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                written += 1
+        return written
+
+    @staticmethod
+    def consolidate_cache(
+        target_db_path: str,
+        shard_db_paths: List[str],
+        shard_audit_paths: List[str],
+        target_audit_path: str,
+        cleanup: bool = True,
+    ) -> None:
+        """Consolidate per-rank shards into a single cache DB + audit log.
+
+        Called by rank 0 after evaluation completes.
+
+        1. Merges all shard DBs into ``target_db_path`` (INSERT OR IGNORE).
+        2. Merges all shard JSONL audit logs into ``target_audit_path``.
+        3. If ``cleanup`` is True, removes the shard files.
+        """
+        # Merge SQLite shards
+        merged_entries = ResponseCache.merge_shards(shard_db_paths, target_db_path)
+        eval_logger.info(f"ResponseCache: consolidated {merged_entries} entries from " f"{len(shard_db_paths)} shard(s) into {target_db_path}")
+
+        # Merge JSONL audit logs
+        merged_lines = ResponseCache.merge_audit_logs(shard_audit_paths, target_audit_path)
+        eval_logger.info(f"ResponseCache: consolidated {merged_lines} audit entries from " f"{len(shard_audit_paths)} log(s) into {target_audit_path}")
+
+        # Cleanup shard files
+        if cleanup:
+            for path in shard_db_paths + shard_audit_paths:
+                try:
+                    if os.path.exists(path):
+                        os.remove(path)
+                        # Also remove WAL/SHM sidecar files for SQLite
+                        for suffix in ("-wal", "-shm"):
+                            sidecar = path + suffix
+                            if os.path.exists(sidecar):
+                                os.remove(sidecar)
+                except OSError as e:
+                    eval_logger.warning(f"ResponseCache: failed to remove shard {path}: {e}")
+            eval_logger.info("ResponseCache: shard files cleaned up")

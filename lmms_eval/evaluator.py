@@ -1,4 +1,5 @@
 import collections
+import copy
 import itertools
 import json
 import os
@@ -17,6 +18,10 @@ import lmms_eval.api
 import lmms_eval.api.metrics
 import lmms_eval.api.registry
 from lmms_eval import models
+from lmms_eval.api.instance import Instance, unwrap_generation_output
+from lmms_eval.api.model import lmms
+from lmms_eval.api.reasoning import parse_reasoning_tags_config, strip_reasoning_tags
+from lmms_eval.api.task import Task
 from lmms_eval.baselines import (
     BASELINE_REGISTRY,
     get_baseline_display_name,
@@ -36,11 +41,22 @@ from lmms_eval.evaluator_utils import (
 )
 from lmms_eval.llm_judge.launcher import get_launcher
 from lmms_eval.loggers.evaluation_tracker import EvaluationTracker
+from lmms_eval.models.model_utils.efficiency_metrics import build_efficiency_summary
+from lmms_eval.models.model_utils.usage_metrics import (
+    is_budget_exceeded,
+    reset_usage_metrics,
+    set_budget,
+    set_task_context,
+    summarize_usage_metrics,
+)
 from lmms_eval.tasks import TaskManager, get_task_dict
 from lmms_eval.utils import (
     create_iterator,
     get_datetime_str,
+    get_git_branch_name,
     get_git_commit_hash,
+    get_lmms_eval_cache_version,
+    get_lmms_eval_version_string,
     handle_non_serializable,
     hash_string,
     is_multimodal_content,
@@ -88,6 +104,7 @@ def simple_evaluate(
     force_simple: bool = False,
     repeats: int = 1,
     baseline: Optional[str] = None,
+    max_tokens: Optional[int] = None,
 ):
     """Instantiate and evaluate a model on a list of tasks.
 
@@ -107,7 +124,7 @@ def simple_evaluate(
     :param device: str, optional
         PyTorch device (e.g. "cpu" or "cuda:0") for running models
     :param use_cache: str, optional
-        Directory for response-level caching (SQLite + JSONL). `None` to disable.
+        Path to a SQLite .db file for response-level caching. `None` to disable.
     :param cache_requests: bool, optional
         Speed up evaluation by caching the building of dataset requests. `None` if not caching.
     :param rewrite_requests_cache: bool, optional
@@ -278,6 +295,9 @@ def simple_evaluate(
     from lmms_eval.models.model_utils.gen_metrics import reset_logged_metrics
 
     reset_logged_metrics()
+    reset_usage_metrics()
+    if max_tokens is not None:
+        set_budget(max_tokens=max_tokens)
 
     # Getting the rank settings
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
@@ -285,7 +305,20 @@ def simple_evaluate(
     world_size = int(os.environ.get("WORLD_SIZE", 1))
 
     response_cache = None
+    _cache_target_db = None  # final consolidated .db path (user-specified)
+    _cache_write_db = None  # DB path used for writes during evaluation
+    _cache_write_audit = None
+    _cache_target_audit = None
+    _cache_shared_db = None  # read-only shared DB for two-tier cache (may be None)
+    _cache_is_two_tier = False  # True when local scratch != target (NFS case)
+    _cache_staging_dir = None  # shared staging dir for multi-node two-tier merges
     if use_cache is not None:
+        from lmms_eval.caching.fs_detect import (
+            FsType,
+            detect_fs_type,
+            find_local_scratch,
+        )
+
         _FUNC_ADDR_RE = re.compile(r" at 0x[0-9a-fA-F]+>")
 
         task_fingerprints = {}
@@ -294,15 +327,84 @@ def simple_evaluate(
                 cfg_str = json.dumps(tobj.dump_config(), sort_keys=True, default=str)
                 cfg_str = _FUNC_ADDR_RE.sub(">", cfg_str)
                 task_fingerprints[tname] = hash_string(cfg_str)[:16]
-        model_hash = hash_string(f"{model}|{model_args}")[:16]
-        cache_dir = os.path.join(use_cache, model_hash)
-        os.makedirs(cache_dir, exist_ok=True)
-        db_path = os.path.join(cache_dir, f"rank{global_rank}.db")
-        audit_path = os.path.join(cache_dir, f"rank{global_rank}.jsonl")
-        model_fp = f"{model}|{model_args}"
-        response_cache = ResponseCache(db_path=db_path, audit_path=audit_path, model_fingerprint=model_fp, task_fingerprints=task_fingerprints)
-        eval_logger.info(f"ResponseCache initialized: {db_path}")
 
+        if isinstance(model_args, dict):
+            model_args_fp = json.dumps(model_args, sort_keys=True, ensure_ascii=True, separators=(",", ":"), default=str)
+        elif isinstance(model_args, str):
+            try:
+                parsed_model_args = simple_parse_args_string(model_args)
+            except Exception:
+                parsed_model_args = model_args
+            if isinstance(parsed_model_args, dict):
+                model_args_fp = json.dumps(parsed_model_args, sort_keys=True, ensure_ascii=True, separators=(",", ":"), default=str)
+            else:
+                model_args_fp = str(model_args)
+        else:
+            model_args_fp = str(model_args)
+
+        model_fp = f"{model}|{model_args_fp}"
+        model_hash = hash_string(model_fp)[:16]
+
+        # Resolve target DB path.
+        # Backward compat: if user passes an existing directory (old --use_cache ./dir style),
+        # place cache.db inside it.  Otherwise treat as a .db file path.
+        _cache_target_db = use_cache
+        if os.path.isdir(_cache_target_db) or _cache_target_db.endswith(os.sep):
+            eval_logger.warning(f"ResponseCache: --use_cache received a directory ({_cache_target_db}). " "In future versions, pass a .db file path directly (e.g. --use_cache ./cache.db). " "Auto-mapping to cache.db inside the directory.")
+            _cache_target_db = os.path.join(_cache_target_db, "cache.db")
+        elif not _cache_target_db.endswith(".db"):
+            _cache_target_db = _cache_target_db + ".db"
+        _cache_target_audit = os.path.splitext(_cache_target_db)[0] + ".audit.jsonl"
+        target_dir = os.path.dirname(os.path.abspath(_cache_target_db))
+        os.makedirs(target_dir, exist_ok=True)
+
+        # Two-tier cache decision: detect if target is on remote storage.
+        # If remote (NFS/CIFS), write to local scratch and merge back after eval.
+        # If local or unknown, write directly to target.
+        target_fs = detect_fs_type(_cache_target_db)
+        if target_fs == FsType.REMOTE:
+            local_scratch = find_local_scratch()
+            if local_scratch is not None:
+                _cache_is_two_tier = True
+                local_cache_dir = os.path.join(local_scratch, "lmms_eval_cache", model_hash)
+                os.makedirs(local_cache_dir, exist_ok=True)
+                # Shared DB: the user-specified NFS path (read-only during eval)
+                _cache_shared_db = _cache_target_db if os.path.exists(_cache_target_db) else None
+                # Write DB: local scratch (fast writes)
+                if world_size > 1:
+                    _cache_write_db = os.path.join(local_cache_dir, f"shard.{global_rank}.db")
+                    _cache_write_audit = os.path.join(local_cache_dir, f"shard.{global_rank}.audit.jsonl")
+                    # Multi-node: each node's local scratch is invisible to rank 0.
+                    # Use a shared staging dir on the target FS for consolidation.
+                    _cache_staging_dir = os.path.splitext(_cache_target_db)[0] + ".staging"
+                    os.makedirs(_cache_staging_dir, exist_ok=True)
+                else:
+                    _cache_write_db = os.path.join(local_cache_dir, "local.db")
+                    _cache_write_audit = os.path.join(local_cache_dir, "local.audit.jsonl")
+                eval_logger.info(f"ResponseCache: two-tier mode - writes to {_cache_write_db}, " f"reads from local + shared ({_cache_target_db})")
+            else:
+                eval_logger.warning("ResponseCache: target is on remote FS but no local scratch found, writing directly")
+
+        # Fallback: direct write to target (local FS, or no scratch available)
+        if not _cache_is_two_tier:
+            if world_size > 1:
+                _cache_write_db = f"{_cache_target_db}.shard.{global_rank}"
+                _cache_write_audit = f"{_cache_target_db}.audit.shard.{global_rank}.jsonl"
+            else:
+                _cache_write_db = _cache_target_db
+                _cache_write_audit = _cache_target_audit
+
+        response_cache = ResponseCache(
+            db_path=_cache_write_db,
+            audit_path=_cache_write_audit,
+            model_fingerprint=model_fp,
+            task_fingerprints=task_fingerprints,
+            shared_db_path=_cache_shared_db,
+            eval_version=get_lmms_eval_cache_version(),
+        )
+        eval_logger.info(f"ResponseCache initialized: {_cache_write_db}")
+
+    eval_succeeded = False
     try:
         results = evaluate(
             lm=lm,
@@ -323,12 +425,87 @@ def simple_evaluate(
             eval_server_launcher=eval_launcher,
             response_cache=response_cache,
         )
+        eval_succeeded = True
     finally:
         if response_cache is not None:
             stats = response_cache.get_stats()
-            eval_logger.info(f"ResponseCache stats: {stats['hits']} hits, {stats['misses']} misses, {stats['skipped_non_deterministic']} skipped, hit rate: {stats['hit_rate']:.1%}")
+            shared_info = f", {stats.get('hits_shared', 0)} from shared DB" if stats.get("hits_shared", 0) else ""
+            eval_logger.info(f"ResponseCache stats: {stats['hits']} hits{shared_info}, " f"{stats['misses']} misses, {stats['skipped_non_deterministic']} skipped, " f"hit rate: {stats['hit_rate']:.1%}")
             response_cache.close()
 
+            # Post-eval consolidation: only on success, rank 0 only.
+            if eval_succeeded and global_rank == 0:
+                if _cache_is_two_tier and world_size > 1 and _cache_staging_dir:
+                    # Two-tier multi-node: each rank copies its local shard to shared staging.
+                    # Rank 0 does its own copy here; other ranks copy below after barrier.
+                    import shutil
+
+                    for src in (_cache_write_db, _cache_write_audit):
+                        if os.path.exists(src):
+                            shutil.copy2(src, _cache_staging_dir)
+
+            # Barrier: all ranks must finish writing before rank 0 merges.
+            if eval_succeeded and response_cache is not None and world_size > 1:
+                if distributed_executor_backend == "accelerate" and hasattr(lm, "accelerator"):
+                    lm.accelerator.wait_for_everyone()
+                elif distributed_executor_backend == "torchrun":
+                    import torch.distributed as dist
+
+                    if dist.is_initialized():
+                        dist.barrier()
+
+            # Non-rank-0: copy local shards to staging (two-tier multi-node).
+            if eval_succeeded and response_cache is not None:
+                if _cache_is_two_tier and world_size > 1 and _cache_staging_dir and global_rank != 0:
+                    import shutil
+
+                    for src in (_cache_write_db, _cache_write_audit):
+                        if os.path.exists(src):
+                            shutil.copy2(src, _cache_staging_dir)
+
+            # Second barrier: ensure all copies to staging are done.
+            if eval_succeeded and response_cache is not None and _cache_is_two_tier and world_size > 1:
+                if distributed_executor_backend == "accelerate" and hasattr(lm, "accelerator"):
+                    lm.accelerator.wait_for_everyone()
+                elif distributed_executor_backend == "torchrun":
+                    import torch.distributed as dist
+
+                    if dist.is_initialized():
+                        dist.barrier()
+
+            # Rank 0: merge all shards into the target DB.
+            if eval_succeeded and global_rank == 0:
+                if _cache_is_two_tier:
+                    if world_size > 1 and _cache_staging_dir:
+                        # Merge from shared staging dir.
+                        shard_db_paths = [os.path.join(_cache_staging_dir, f"shard.{r}.db") for r in range(world_size)]
+                        shard_audit_paths = [os.path.join(_cache_staging_dir, f"shard.{r}.audit.jsonl") for r in range(world_size)]
+                    else:
+                        shard_db_paths = [_cache_write_db]
+                        shard_audit_paths = [_cache_write_audit]
+                    ResponseCache.consolidate_cache(
+                        target_db_path=_cache_target_db,
+                        shard_db_paths=shard_db_paths,
+                        shard_audit_paths=shard_audit_paths,
+                        target_audit_path=_cache_target_audit,
+                        cleanup=True,
+                    )
+                    # Clean up staging dir.
+                    if _cache_staging_dir and os.path.isdir(_cache_staging_dir):
+                        import shutil
+
+                        shutil.rmtree(_cache_staging_dir, ignore_errors=True)
+                elif world_size > 1:
+                    # Direct mode, multi-GPU: merge per-rank shards into target.
+                    shard_db_paths = [f"{_cache_target_db}.shard.{r}" for r in range(world_size)]
+                    shard_audit_paths = [f"{_cache_target_db}.audit.shard.{r}.jsonl" for r in range(world_size)]
+                    ResponseCache.consolidate_cache(
+                        target_db_path=_cache_target_db,
+                        shard_db_paths=shard_db_paths,
+                        shard_audit_paths=shard_audit_paths,
+                        target_audit_path=_cache_target_audit,
+                        cleanup=True,
+                    )
     if global_rank == 0:
         from lmms_eval.models.model_utils.gen_metrics import summarize_logged_metrics
 
@@ -364,11 +541,29 @@ def simple_evaluate(
                 "fewshot_seed": fewshot_random_seed,
             }
         )
+        # Store full resolved CLI args for reproducibility
+        if cli_args is not None:
+            resolved = {}
+            for key, value in vars(cli_args).items():
+                try:
+                    json.dumps(value)
+                    resolved[key] = value
+                except (TypeError, ValueError):
+                    resolved[key] = str(value)
+            results["config"]["resolved_cli_args"] = resolved
+
         results["git_hash"] = get_git_commit_hash()
+        results["git_branch"] = get_git_branch_name()
+        results["lmms_eval_version"] = get_lmms_eval_version_string()
         results["date"] = datetime_str
         throughput_summary = summarize_logged_metrics()
         if throughput_summary:
             results["throughput"] = throughput_summary
+        usage_summary = summarize_usage_metrics()
+        results["usage"] = usage_summary
+        efficiency_summary = build_efficiency_summary(results)
+        if efficiency_summary:
+            results["efficiency"] = efficiency_summary
         # add_env_info(results)  # additional environment info to results
         # add_tokenizer_info(results, lm)  # additional info about tokenizer
 
@@ -436,9 +631,160 @@ def simple_evaluate(
 decontaminate_suffix = "_decontaminate"
 
 
+def _run_generate_until_agentic(
+    lm,
+    requests: list[Instance],
+    agentic_trace_mode: str = "basic",
+    response_cache: Optional[ResponseCache] = None,
+) -> list[str]:
+    responses: list[str] = []
+
+    for req in requests:
+        (
+            current_context,
+            generation_kwargs,
+            current_doc_to_visual,
+            doc_to_text,
+            doc_id,
+            task_name,
+            split,
+        ) = req.args
+
+        if not callable(doc_to_text):
+            raise ValueError("generate_until_agentic requires callable doc_to_text")
+
+        max_agentic_steps = int(generation_kwargs.get("max_agentic_steps", 12))
+        base_generation_kwargs = copy.deepcopy(generation_kwargs)
+        base_generation_kwargs.pop("max_agentic_steps", None)
+
+        model_outputs: list[str] = []
+        previous_round_info = None
+        final_response = ""
+        full_round_trace: list[dict] = []
+
+        for round_idx in range(max_agentic_steps):
+            round_input_context = current_context
+            if getattr(lm, "is_simple", False):
+                single_req = Instance(
+                    request_type="generate_until",
+                    arguments=(current_context, copy.deepcopy(base_generation_kwargs), current_doc_to_visual, doc_id, task_name, split),
+                    idx=0,
+                    metadata=req.metadata,
+                )
+            else:
+                current_doc = lm.task_dict[task_name][split][doc_id]
+
+                def _agentic_doc_to_messages(_doc):
+                    visuals = current_doc_to_visual(_doc)
+                    if visuals is None:
+                        visuals = []
+                    content = []
+                    for visual in visuals:
+                        if isinstance(visual, dict):
+                            content.append({"type": "audio", "url": visual})
+                        elif isinstance(visual, str):
+                            content.append({"type": "video", "url": visual})
+                        else:
+                            content.append({"type": "image", "url": visual})
+                    content.append({"type": "text", "text": current_context})
+                    return [{"role": "user", "content": content}]
+
+                single_req = Instance(
+                    request_type="generate_until",
+                    arguments=(current_context, _agentic_doc_to_messages, copy.deepcopy(base_generation_kwargs), doc_id, task_name, split),
+                    idx=0,
+                    metadata=req.metadata,
+                )
+            if response_cache is not None:
+                current_raw_output = response_cache.execute(lm, "generate_until", [single_req])[0]
+            else:
+                current_raw_output = lm.generate_until([single_req])[0]
+            current_output, _ = unwrap_generation_output(current_raw_output)
+            model_outputs.append(current_output)
+            final_response = current_output
+
+            step_payload = doc_to_text(
+                lm.task_dict[task_name][split][doc_id],
+                previous_output=model_outputs,
+                round_idx=round_idx + 1,
+                previous_round_info=previous_round_info,
+            )
+
+            if isinstance(step_payload, tuple) and len(step_payload) == 5:
+                visuals, next_context, terminal_signal, updated_outputs, next_round_info = step_payload
+                if updated_outputs is not None:
+                    model_outputs = list(updated_outputs)
+                    if model_outputs:
+                        final_response = model_outputs[-1]
+                previous_round_info = next_round_info
+
+                if agentic_trace_mode == "full":
+                    round_record = {
+                        "round_idx": round_idx + 1,
+                        "round_input": round_input_context,
+                        "model_output": current_output,
+                        "terminal": bool(terminal_signal),
+                    }
+                    if isinstance(next_round_info, dict):
+                        round_record["state"] = next_round_info.get("state")
+                        round_record["tool_result"] = next_round_info.get("last_tool_result")
+                        round_record["tool_calls"] = next_round_info.get("tool_calls")
+                        round_record["valid_tool_calls"] = next_round_info.get("valid_tool_calls")
+                        round_record["invalid_steps"] = next_round_info.get("invalid_steps")
+                    if next_context is not None:
+                        round_record["next_input"] = next_context
+                    full_round_trace.append(round_record)
+
+                if terminal_signal:
+                    break
+
+                if next_context is not None:
+                    current_context = next_context
+                if visuals is not None:
+                    current_doc_to_visual = lambda _doc, _visuals=visuals: _visuals
+            elif isinstance(step_payload, str):
+                current_context = step_payload
+            else:
+                break
+
+        if previous_round_info is not None and not (isinstance(final_response, str) and final_response.strip().startswith("{")):
+            state = previous_round_info.get("state", {}) if isinstance(previous_round_info, dict) else {}
+            valid_tool_calls = float(previous_round_info.get("valid_tool_calls", previous_round_info.get("tool_calls", 0))) if isinstance(previous_round_info, dict) else 0.0
+            invalid_steps = float(previous_round_info.get("invalid_steps", 0.0)) if isinstance(previous_round_info, dict) else 0.0
+            fallback_payload = {
+                "success": False,
+                "error": "max_agentic_steps_reached",
+                "tool_calls": float(previous_round_info.get("tool_calls", 0)) if isinstance(previous_round_info, dict) else 0.0,
+                "valid_tool_calls": valid_tool_calls,
+                "invalid_steps": invalid_steps,
+                "state": state,
+                "last_model_output": final_response,
+                "trace": model_outputs,
+            }
+            if isinstance(state, dict):
+                for key in ["cash", "days_elapsed", "inventory", "mobile_data_working"]:
+                    if key in state:
+                        fallback_payload[key] = state[key]
+            final_response = json.dumps(fallback_payload, ensure_ascii=False)
+
+        if agentic_trace_mode == "full":
+            try:
+                parsed_response = json.loads(final_response) if isinstance(final_response, str) else None
+                if isinstance(parsed_response, dict):
+                    parsed_response["agentic_trace_mode"] = "full"
+                    parsed_response["agentic_rounds"] = full_round_trace
+                    final_response = json.dumps(parsed_response, ensure_ascii=False)
+            except (TypeError, json.JSONDecodeError):
+                pass
+
+        responses.append(final_response)
+
+    return responses
+
+
 @positional_deprecated
 def evaluate(
-    lm: "LM",
+    lm,
     task_dict,
     limit: Optional[int] = None,
     offset: int = 0,
@@ -525,7 +871,7 @@ def evaluate(
         lm.accelerator = Accelerator()
 
     for task_output in eval_tasks:
-        task: Task = task_output.task
+        task = task_output.task
         task_name = task_output.task_name
         task.args = cli_args
 
@@ -597,7 +943,7 @@ def evaluate(
                 raise ValueError(f"Invalid distributed_executor_backend: {distributed_executor_backend}. Choose either 'accelerate' or 'torchrun'.")
 
             # "multiple_choice" task types dispatch (several) "loglikelihood" request types
-            reqtype = "loglikelihood" if task.OUTPUT_TYPE == "multiple_choice" else task.OUTPUT_TYPE
+            reqtype = task.instances[0].request_type
             # compute number of pseudo-batches to pad with (FSDP/DDP require even batches among ranks)
             numpad = max(gathered_item) - gathered_item[lm.rank]
             # todo: may not account for padding in cases like SquadV2 which has multiple req types
@@ -617,14 +963,29 @@ def evaluate(
                 cloned_reqs.extend([req] * req.repeats)
 
         # run requests through model (with optional response cache)
-        if response_cache is not None:
+        if reqtype == "generate_until_agentic":
+            trace_mode = "basic"
+            if cli_args is not None:
+                trace_mode = getattr(cli_args, "agentic_trace_mode", "basic")
+            resps = _run_generate_until_agentic(
+                lm,
+                cloned_reqs,
+                agentic_trace_mode=trace_mode,
+                response_cache=response_cache,
+            )
+        elif response_cache is not None:
             resps = response_cache.execute(lm, reqtype, cloned_reqs)
         else:
             resps = getattr(lm, reqtype)(cloned_reqs)
 
-        # put responses from model into a list of length K for each request.
         for x, req in zip(resps, cloned_reqs):
-            req.resps.append(x)
+            text, tc = unwrap_generation_output(x)
+            req.resps.append(text)
+            req.token_counts.append(tc)
+
+        if is_budget_exceeded():
+            eval_logger.warning("Token budget reached after '{}' requests. Skipping remaining request types.", reqtype)
+            break
 
         if world_size > 1:
             if distributed_executor_backend == "accelerate":
@@ -652,6 +1013,7 @@ def evaluate(
     for task_output in eval_tasks:
         task = task_output.task
         task.apply_filters()
+        set_task_context(task_output.task_name)
 
         ### Collect values of metrics on all datapoints ###
         # # unpack results and sort back in order and return control to Task
@@ -665,6 +1027,11 @@ def evaluate(
             instances.sort(key=lambda x: x.idx)
         # iterate over different filters used
         for filter_key in task.instances[0].filtered_resps.keys():
+            # Resolve reasoning tags for this task
+            cli_reasoning_tags = getattr(cli_args, "reasoning_tags", None) if cli_args else None
+            task_reasoning_tags = getattr(task.config, "reasoning_tags", None)
+            reasoning_tags = parse_reasoning_tags_config(cli_value=cli_reasoning_tags, task_value=task_reasoning_tags)
+
             if cli_args is not None and not cli_args.process_with_media:
                 doc_iterator = create_iterator(
                     enumerate(task.eval_docs_no_media),
@@ -696,6 +1063,17 @@ def evaluate(
             pbar = tqdm(total=total_docs, desc="Postprocessing", disable=(RANK != 0))
             for doc_id, doc in doc_iterator:
                 requests = instances_by_doc_id[doc_id]
+
+                # Strip reasoning tags before scoring
+                if reasoning_tags is not None:
+                    for req in requests:
+                        raw_resp = req.filtered_resps[filter_key]
+                        req.raw_filtered_resps[filter_key] = raw_resp
+                        if isinstance(raw_resp, str):
+                            req.filtered_resps[filter_key] = strip_reasoning_tags(raw_resp, reasoning_tags)
+                        elif isinstance(raw_resp, list):
+                            req.filtered_resps[filter_key] = [strip_reasoning_tags(r, reasoning_tags) if isinstance(r, str) else r for r in raw_resp]
+
                 metrics = task.process_results(doc, [req.filtered_resps[filter_key] for req in requests])
 
                 # For stability metrics: compute per-sample scores when repeats > 1
@@ -728,14 +1106,22 @@ def evaluate(
                             # else:
                             #     filtered_arguments.append(_handle_non_serializable(value))
 
+                    per_sample_tc = []
+                    for req in requests:
+                        if req.token_counts:
+                            tc = req.token_counts[0]
+                            per_sample_tc.append(tc.to_dict() if tc is not None else None)
+                        else:
+                            per_sample_tc.append(None)
+
                     example = {
                         "doc_id": doc_id,
                         "doc": saved_doc,
                         "target": target,
-                        # "pred": metrics['coco_cap_chair_i']['pred'],
                         "arguments": filtered_arguments,
-                        "resps": [req.resps for req in requests],
+                        "resps": [req.raw_filtered_resps.get(filter_key, req.resps) for req in requests],
                         "filtered_resps": [req.filtered_resps[filter_key] for req in requests],
+                        "token_counts": per_sample_tc,
                         "doc_hash": hash_string(
                             json.dumps(
                                 requests[0].doc,
@@ -744,7 +1130,6 @@ def evaluate(
                                 ensure_ascii=False,
                             )
                         ),
-                        # Removing prompt hash and target hash here
                     }
                     example.update(metrics)
                     task_output.logged_samples.append(example)
@@ -753,6 +1138,7 @@ def evaluate(
                 pbar.update(1)
 
             pbar.close()
+        set_task_context(None)
 
     if WORLD_SIZE > 1:
         # if multigpu, then gather data across all ranks to rank 0

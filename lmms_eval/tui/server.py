@@ -8,6 +8,7 @@ import asyncio
 import json
 import os
 import platform
+import re
 import signal
 import socket
 import subprocess
@@ -16,6 +17,7 @@ from importlib.metadata import version as pkg_version
 from pathlib import Path
 from typing import Any
 
+import yaml
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
@@ -65,6 +67,20 @@ def get_repo_root() -> str:
         return ""
 
 
+def _detect_env_setup() -> str:
+    """Auto-detect environment activation command.
+
+    Builds: cd <repo_root> && source .venv/bin/activate
+    Returns empty string if no venv found.
+    """
+    repo_root = get_repo_root()
+    if repo_root:
+        activate = Path(repo_root) / ".venv" / "bin" / "activate"
+        if activate.exists():
+            return f"cd {repo_root} && source .venv/bin/activate"
+    return ""
+
+
 def get_system_info() -> dict[str, str]:
     return {
         "hostname": socket.gethostname(),
@@ -100,6 +116,7 @@ class EvalRequest(BaseModel):
     log_samples: bool = True
     verbosity: str = "INFO"
     device: str | None = None
+    env_setup: str = ""
 
 
 class EvalStartResponse(BaseModel):
@@ -118,10 +135,46 @@ class PreviewRequest(BaseModel):
     log_samples: bool = True
     verbosity: str = "INFO"
     device: str | None = None
+    env_setup: str = ""
 
 
 class PreviewResponse(BaseModel):
     command: str
+
+
+class ExportYamlRequest(BaseModel):
+    model: str
+    model_args: str = ""
+    tasks: list[str]
+    env_vars: str = ""
+    batch_size: int = 1
+    limit: int | None = 10
+    output_path: str = "./logs/"
+    log_samples: bool = True
+    verbosity: str = "INFO"
+    device: str | None = None
+    env_setup: str = ""
+
+
+class ExportYamlResponse(BaseModel):
+    yaml_content: str
+
+
+class ImportYamlRequest(BaseModel):
+    yaml_content: str
+
+
+class ImportYamlResponse(BaseModel):
+    model: str = ""
+    model_args: str = ""
+    tasks: list[str] = []
+    env_vars: str = ""
+    batch_size: int = 1
+    limit: int | None = None
+    output_path: str = "./logs/"
+    log_samples: bool = False
+    verbosity: str = "INFO"
+    device: str | None = None
 
 
 # --- Endpoints ---
@@ -134,6 +187,7 @@ async def health() -> dict[str, Any]:
         "version": get_version(),
         "git": get_git_info(),
         "system": get_system_info(),
+        "env_setup": _detect_env_setup(),
     }
 
 
@@ -160,6 +214,37 @@ async def get_tasks() -> list[TaskInfo]:
     ]
 
 
+@app.get("/tasks/{task_id}/yaml")
+async def get_task_yaml(task_id: str) -> dict[str, str]:
+    tasks_dir = Path(__file__).resolve().parent.parent / "tasks"
+    if not tasks_dir.exists():
+        raise HTTPException(status_code=500, detail="Tasks directory not found")
+
+    task_pattern = re.compile(rf"^\s*task\s*:\s*[\"']?{re.escape(task_id)}[\"']?\s*$", re.MULTILINE)
+    yaml_files = sorted({*tasks_dir.rglob("*.yaml"), *tasks_dir.rglob("*.yml")})
+
+    for yaml_file in yaml_files:
+        try:
+            yaml_content = yaml_file.read_text(encoding="utf-8")
+        except OSError:
+            continue
+
+        if task_pattern.search(yaml_content):
+            repo_root = Path(__file__).resolve().parents[2]
+            try:
+                relative_path = str(yaml_file.relative_to(repo_root))
+            except ValueError:
+                relative_path = str(yaml_file)
+
+            return {
+                "task_id": task_id,
+                "yaml": yaml_content,
+                "path": relative_path,
+            }
+
+    raise HTTPException(status_code=404, detail=f"Task YAML not found for '{task_id}'")
+
+
 def _normalize_env_line(line: str) -> str | None:
     stripped = line.strip()
     if not stripped or stripped.startswith("#"):
@@ -180,6 +265,29 @@ def _build_env_exports(env_vars: str) -> list[str]:
     return exports
 
 
+def _env_vars_to_dict(env_vars: str) -> dict[str, str]:
+    """Convert env_vars multi-line string to a dict for YAML export."""
+    env_dict: dict[str, str] = {}
+    for line in env_vars.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if stripped.startswith("export "):
+            stripped = stripped[7:]
+        if "=" in stripped:
+            key, _, value = stripped.partition("=")
+            env_dict[key.strip()] = value.strip()
+    return env_dict
+
+
+def _dict_to_env_vars(env_dict: dict[str, str]) -> str:
+    """Convert env dict from YAML to env_vars multi-line string for UI."""
+    lines = []
+    for key, value in env_dict.items():
+        lines.append(f"export {key}={value}")
+    return "\n".join(lines)
+
+
 def _build_command(request: EvalRequest | PreviewRequest) -> str:
     """Build the lmms_eval command string."""
     parts = ["python -m lmms_eval"]
@@ -198,9 +306,14 @@ def _build_command(request: EvalRequest | PreviewRequest) -> str:
     if request.device:
         parts.append(f"--device {request.device}")
     command = " \\\n    ".join(parts)
-    env_exports = _build_env_exports(request.env_vars)
-    if env_exports:
-        return "\n".join([*env_exports, command])
+    # Collect all prefix lines: env_setup first, then env_vars exports
+    prefix_lines: list[str] = []
+    env_setup = request.env_setup or _detect_env_setup()
+    if env_setup:
+        prefix_lines.append(env_setup)
+    prefix_lines.extend(_build_env_exports(request.env_vars))
+    if prefix_lines:
+        return "\n".join([*prefix_lines, command])
     return command
 
 
@@ -222,10 +335,15 @@ def _build_shell_command(request: EvalRequest) -> str:
     if request.device:
         parts.extend(["--device", request.device])
     command = " ".join(parts)
-    env_exports = _build_env_exports(request.env_vars)
-    if env_exports:
-        export_prefix = " && ".join(env_exports)
-        return f"{export_prefix} && {command}"
+    # Collect all prefix commands: env_setup first, then env_vars exports
+    prefix_parts: list[str] = []
+    env_setup = request.env_setup or _detect_env_setup()
+    if env_setup:
+        prefix_parts.append(env_setup)
+    prefix_parts.extend(_build_env_exports(request.env_vars))
+    if prefix_parts:
+        prefix = " && ".join(prefix_parts)
+        return f"{prefix} && {command}"
     return command
 
 
@@ -234,6 +352,71 @@ async def preview_command(request: PreviewRequest) -> PreviewResponse:
     """Generate command preview without executing."""
     command = _build_command(request)
     return PreviewResponse(command=command)
+
+
+@app.post("/eval/export-yaml", response_model=ExportYamlResponse)
+async def export_yaml(request: ExportYamlRequest) -> ExportYamlResponse:
+    """Export current UI config as a YAML config file."""
+    config: dict[str, Any] = {}
+
+    env_dict = _env_vars_to_dict(request.env_vars)
+    if env_dict:
+        config["env"] = env_dict
+
+    config["model"] = request.model
+    if request.model_args:
+        config["model_args"] = request.model_args
+    if request.tasks:
+        config["tasks"] = ",".join(request.tasks)
+    config["batch_size"] = request.batch_size
+    if request.limit is not None:
+        config["limit"] = request.limit
+    config["output_path"] = request.output_path
+    if request.log_samples:
+        config["log_samples"] = True
+    config["verbosity"] = request.verbosity
+    if request.device:
+        config["device"] = request.device
+
+    header = "# LMMs-Eval config exported from Web UI\n" "# Usage: python -m lmms_eval --config <this_file>.yaml\n" "# CLI args override YAML values.\n\n"
+    yaml_content = header + yaml.dump(config, default_flow_style=False, sort_keys=False, allow_unicode=True)
+    return ExportYamlResponse(yaml_content=yaml_content)
+
+
+@app.post("/eval/import-yaml", response_model=ImportYamlResponse)
+async def import_yaml(request: ImportYamlRequest) -> ImportYamlResponse:
+    """Import a YAML config file into UI config values."""
+    try:
+        config = yaml.safe_load(request.yaml_content)
+    except yaml.YAMLError as e:
+        raise HTTPException(status_code=400, detail=f"Invalid YAML: {e}")
+
+    if not isinstance(config, dict):
+        raise HTTPException(status_code=400, detail="YAML must be a dict (not a list or scalar)")
+
+    env_dict = config.pop("env", {})
+    env_vars = _dict_to_env_vars(env_dict) if env_dict else ""
+
+    tasks_raw = config.get("tasks", "")
+    if isinstance(tasks_raw, str):
+        tasks = [t.strip() for t in tasks_raw.split(",") if t.strip()]
+    elif isinstance(tasks_raw, list):
+        tasks = tasks_raw
+    else:
+        tasks = []
+
+    return ImportYamlResponse(
+        model=config.get("model", ""),
+        model_args=config.get("model_args", ""),
+        tasks=tasks,
+        env_vars=env_vars,
+        batch_size=config.get("batch_size", 1),
+        limit=config.get("limit"),
+        output_path=config.get("output_path", "./logs/"),
+        log_samples=config.get("log_samples", False),
+        verbosity=config.get("verbosity", "INFO"),
+        device=config.get("device"),
+    )
 
 
 @app.post("/eval/start", response_model=EvalStartResponse)
