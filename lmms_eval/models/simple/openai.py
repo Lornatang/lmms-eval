@@ -41,11 +41,34 @@ cpu, _ = optional_import("decord", "cpu")
 load_dotenv(verbose=True)
 
 
+def _normalize_openai_message_content(content) -> str:
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        text_parts = []
+        for part in content:
+            if isinstance(part, str):
+                text_parts.append(part)
+                continue
+            if not isinstance(part, dict):
+                continue
+            if part.get("type") == "text" and isinstance(part.get("text"), str):
+                text_parts.append(part["text"])
+                continue
+            if isinstance(part.get("content"), str):
+                text_parts.append(part["content"])
+        return "".join(text_parts)
+    return str(content)
+
+
 @register_model("openai")
 class OpenAICompatible(lmms):
     def __init__(
         self,
         model_version: str = "grok-2-latest",
+        model: Optional[str] = None,
         base_url: Optional[str] = None,
         api_key: Optional[str] = None,
         timeout: int = 10,
@@ -77,6 +100,12 @@ class OpenAICompatible(lmms):
             HTTPS_PROXY, ALL_PROXY) and macOS proxy server settings.
         """
         super().__init__()
+        # Accept both `model` and `model_version` for convenience, since
+        # `--model_args model=xxx` is a common user expectation.
+        if model is not None:
+            model_version = model
+        if kwargs:
+            eval_logger.warning(f"Unknown model_args ignored: {list(kwargs.keys())}. " f"Check the supported parameters for the 'openai' backend.")
         self.model_version = model_version
         self.timeout = timeout
         self.retry_backoff_s = max(0.0, float(retry_backoff_s))
@@ -311,7 +340,7 @@ class OpenAICompatible(lmms):
             for attempt in range(self.max_retries):
                 try:
                     response = self.client.chat.completions.create(**payload)
-                    response_text = response.choices[0].message.content
+                    response_text = _normalize_openai_message_content(response.choices[0].message.content)
                     token_counts = None
                     if hasattr(response, "usage") and response.usage:
                         log_usage(

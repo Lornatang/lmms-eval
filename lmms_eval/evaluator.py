@@ -1,10 +1,13 @@
+import base64
 import collections
 import copy
 import itertools
 import json
+import mimetypes
 import os
 import random
 import re
+from datetime import timedelta
 from typing import Callable, List, Optional, Union
 
 import numpy as np
@@ -13,6 +16,11 @@ import torch.distributed as dist
 from accelerate import Accelerator
 from loguru import logger as eval_logger
 from tqdm import tqdm
+
+# Increase default torch.distributed process group timeout from 30 min to 24 hours.
+# With dp=16 across 2 nodes, workload imbalance causes fast ranks to finish hours
+# before slow ranks (e.g. 1h24m vs 4h24m).  3h was not enough — increase to 24h.
+torch.distributed.distributed_c10d.default_pg_timeout = timedelta(hours=24)
 
 import lmms_eval.api
 import lmms_eval.api.metrics
@@ -55,7 +63,6 @@ from lmms_eval.utils import (
     get_datetime_str,
     get_git_branch_name,
     get_git_commit_hash,
-    get_lmms_eval_cache_version,
     get_lmms_eval_version_string,
     handle_non_serializable,
     hash_string,
@@ -64,6 +71,135 @@ from lmms_eval.utils import (
     run_task_tests,
     simple_parse_args_string,
 )
+
+IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".tif", ".tiff")
+
+
+def _enable_reentrant_filelocks() -> None:
+    """Force singleton file locks so nested load_dataset calls cannot deadlock.
+
+    filelock >= 3.16 detects in-thread deadlocks via a global ``_registry``
+    that tracks *all* held locks by canonical path and instance ``id()``.
+    Meanwhile, ``is_singleton=True`` caches instances per-class in
+    ``cls._instances``.  ``filelock.FileLock`` (``UnixFileLock``) and
+    ``datasets.utils._filelock.FileLock`` are **different classes**, so each
+    maintains a separate singleton cache — two distinct instances can end up
+    targeting the same OS lock file, triggering the global deadlock check.
+
+    Fix: maintain a **cross-class** singleton cache keyed on the canonical
+    lock path.  Any target-class ``FileLock(path)`` call returns the single
+    cached instance regardless of which class originated it.
+    """
+    if getattr(_enable_reentrant_filelocks, "_patched", False):
+        return
+
+    import filelock as _fl
+    import filelock._api as _fl_api
+    from datasets.utils import _filelock as _datasets_filelock
+
+    target_lock_classes = tuple(
+        cls
+        for cls in (
+            getattr(_fl, "FileLock", None),
+            getattr(_datasets_filelock, "FileLock", None),
+        )
+        if cls is not None
+    )
+
+    original_call = _fl_api.FileLockMeta.__call__
+    _cross_class_cache: dict[str, _fl_api.BaseFileLock] = {}
+
+    def _patched_call(cls, lock_file, *args, **kwargs):
+        if cls in target_lock_classes:
+            canonical = str(lock_file)
+            cached = _cross_class_cache.get(canonical)
+            if cached is not None:
+                return cached
+            kwargs.setdefault("is_singleton", True)
+            if cls is getattr(_datasets_filelock, "FileLock", None):
+                unset_mode = getattr(_fl_api, "_UNSET_FILE_MODE", None)
+                if kwargs.get("mode", unset_mode) == unset_mode:
+                    umask = os.umask(0o666)
+                    os.umask(umask)
+                    kwargs["mode"] = 0o666 & ~umask
+            instance = original_call(cls, lock_file, *args, **kwargs)
+            _cross_class_cache[canonical] = instance
+            return instance
+        return original_call(cls, lock_file, *args, **kwargs)
+
+    _fl_api.FileLockMeta.__call__ = _patched_call
+    _enable_reentrant_filelocks._patched = True
+
+
+def _looks_like_image_ref(value: str) -> bool:
+    lowered = value.lower().strip()
+    if lowered.startswith("data:image/"):
+        return True
+    if lowered.startswith(("http://", "https://", "file://")):
+        return any(ext in lowered for ext in IMAGE_EXTENSIONS)
+    return lowered.endswith(IMAGE_EXTENSIONS)
+
+
+def _guess_image_mime(path_hint: Optional[str]) -> str:
+    if path_hint:
+        guessed, _ = mimetypes.guess_type(path_hint)
+        if guessed and guessed.startswith("image/"):
+            return guessed
+    return "image/png"
+
+
+def _append_image_source(target: list[str], source: str, seen: set[str], max_items: int) -> None:
+    if not source or source in seen or len(target) >= max_items:
+        return
+    seen.add(source)
+    target.append(source)
+
+
+def _extract_image_sources(value, out: list[str], seen: set[str], max_items: int = 4, max_inline_bytes: int = 300_000) -> None:
+    if len(out) >= max_items:
+        return
+
+    if isinstance(value, str):
+        if _looks_like_image_ref(value):
+            _append_image_source(out, value, seen, max_items)
+        return
+
+    if isinstance(value, dict):
+        path_hint: Optional[str] = None
+        for key in ("url", "uri", "path", "image", "image_url", "image_path"):
+            candidate = value.get(key)
+            if isinstance(candidate, str):
+                if key == "path":
+                    path_hint = candidate
+                if _looks_like_image_ref(candidate):
+                    _append_image_source(out, candidate, seen, max_items)
+
+        raw_bytes = value.get("bytes")
+        if isinstance(raw_bytes, (bytes, bytearray)) and 0 < len(raw_bytes) <= max_inline_bytes and len(out) < max_items:
+            mime = _guess_image_mime(path_hint)
+            encoded = base64.b64encode(raw_bytes).decode("ascii")
+            _append_image_source(out, f"data:{mime};base64,{encoded}", seen, max_items)
+
+        for nested in value.values():
+            _extract_image_sources(nested, out, seen, max_items=max_items, max_inline_bytes=max_inline_bytes)
+        return
+
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            _extract_image_sources(item, out, seen, max_items=max_items, max_inline_bytes=max_inline_bytes)
+            if len(out) >= max_items:
+                break
+
+
+def _collect_input_media(doc: dict, request_args: list) -> list[str]:
+    sources: list[str] = []
+    seen: set[str] = set()
+    _extract_image_sources(doc, sources, seen)
+    for arg in request_args:
+        if len(sources) >= 4:
+            break
+        _extract_image_sources(arg, sources, seen)
+    return sources
 
 
 @positional_deprecated
@@ -124,7 +260,7 @@ def simple_evaluate(
     :param device: str, optional
         PyTorch device (e.g. "cpu" or "cuda:0") for running models
     :param use_cache: str, optional
-        Path to a SQLite .db file for response-level caching. `None` to disable.
+        Path to a response-cache root directory or SQLite .db file for response-level caching. `None` to disable.
     :param cache_requests: bool, optional
         Speed up evaluation by caching the building of dataset requests. `None` if not caching.
     :param rewrite_requests_cache: bool, optional
@@ -223,7 +359,37 @@ def simple_evaluate(
     elif isinstance(model, lmms_eval.api.model.lmms):
         lm = model
     task_type = "simple" if lm.is_simple else "chat"
-    task_dict = get_task_dict(tasks, task_manager, task_type)
+
+    # filelock >= 3.16 decides singleton behavior in the metaclass __call__ path,
+    # before __init__ runs. datasets.load_dataset() uses datasets.utils._filelock.FileLock,
+    # which wraps filelock separately, so patch the shared metaclass instead.
+    _enable_reentrant_filelocks()
+
+    # Make SSLContext picklable so dill/datasets can fingerprint closures that
+    # capture the HF Hub HTTP session.  Without this, datasets 4.x raises
+    # "TypeError: cannot pickle 'SSLContext' object" during load_dataset().
+    import ssl
+
+    if not hasattr(ssl.SSLContext, "_orig_reduce"):
+        ssl.SSLContext._orig_reduce = True  # sentinel to avoid double-patching
+        ssl.SSLContext.__reduce__ = lambda self: (ssl.SSLContext, (self.protocol,))
+
+    # Stagger dataset loading across ranks to avoid cross-process FileLock contention
+    # on shared FS.  Rank 0 loads first (populates HF cache), then all others load
+    # from warm cache after a barrier.
+    # NOTE: use torch.distributed directly (not `dist`) because later code in this function
+    # has local `import torch.distributed as dist` which shadows the module-level import.
+    if torch.distributed.is_initialized():
+        rank = torch.distributed.get_rank()
+        if rank == 0:
+            eval_logger.info("Rank 0: loading datasets first to warm HF cache")
+            task_dict = get_task_dict(tasks, task_manager, task_type)
+        torch.distributed.barrier()
+        if rank != 0:
+            eval_logger.info(f"Rank {rank}: loading datasets from warm cache")
+            task_dict = get_task_dict(tasks, task_manager, task_type)
+    else:
+        task_dict = get_task_dict(tasks, task_manager, task_type)
 
     # helper function to recursively apply config overrides to leaf subtasks, skipping their constituent groups.
     # (setting of num_fewshot ; bypassing metric calculation ; setting fewshot seed)
@@ -305,104 +471,15 @@ def simple_evaluate(
     world_size = int(os.environ.get("WORLD_SIZE", 1))
 
     response_cache = None
-    _cache_target_db = None  # final consolidated .db path (user-specified)
-    _cache_write_db = None  # DB path used for writes during evaluation
-    _cache_write_audit = None
-    _cache_target_audit = None
-    _cache_shared_db = None  # read-only shared DB for two-tier cache (may be None)
-    _cache_is_two_tier = False  # True when local scratch != target (NFS case)
-    _cache_staging_dir = None  # shared staging dir for multi-node two-tier merges
     if use_cache is not None:
-        from lmms_eval.caching.fs_detect import (
-            FsType,
-            detect_fs_type,
-            find_local_scratch,
+        response_cache = ResponseCache.create(
+            cache_root=use_cache,
+            model=model,
+            model_args=model_args,
+            task_dict=task_dict,
+            world_size=world_size,
+            global_rank=global_rank,
         )
-
-        _FUNC_ADDR_RE = re.compile(r" at 0x[0-9a-fA-F]+>")
-
-        task_fingerprints = {}
-        for tname, tobj in task_dict.items():
-            if hasattr(tobj, "dump_config"):
-                cfg_str = json.dumps(tobj.dump_config(), sort_keys=True, default=str)
-                cfg_str = _FUNC_ADDR_RE.sub(">", cfg_str)
-                task_fingerprints[tname] = hash_string(cfg_str)[:16]
-
-        if isinstance(model_args, dict):
-            model_args_fp = json.dumps(model_args, sort_keys=True, ensure_ascii=True, separators=(",", ":"), default=str)
-        elif isinstance(model_args, str):
-            try:
-                parsed_model_args = simple_parse_args_string(model_args)
-            except Exception:
-                parsed_model_args = model_args
-            if isinstance(parsed_model_args, dict):
-                model_args_fp = json.dumps(parsed_model_args, sort_keys=True, ensure_ascii=True, separators=(",", ":"), default=str)
-            else:
-                model_args_fp = str(model_args)
-        else:
-            model_args_fp = str(model_args)
-
-        model_fp = f"{model}|{model_args_fp}"
-        model_hash = hash_string(model_fp)[:16]
-
-        # Resolve target DB path.
-        # Backward compat: if user passes an existing directory (old --use_cache ./dir style),
-        # place cache.db inside it.  Otherwise treat as a .db file path.
-        _cache_target_db = use_cache
-        if os.path.isdir(_cache_target_db) or _cache_target_db.endswith(os.sep):
-            eval_logger.warning(f"ResponseCache: --use_cache received a directory ({_cache_target_db}). " "In future versions, pass a .db file path directly (e.g. --use_cache ./cache.db). " "Auto-mapping to cache.db inside the directory.")
-            _cache_target_db = os.path.join(_cache_target_db, "cache.db")
-        elif not _cache_target_db.endswith(".db"):
-            _cache_target_db = _cache_target_db + ".db"
-        _cache_target_audit = os.path.splitext(_cache_target_db)[0] + ".audit.jsonl"
-        target_dir = os.path.dirname(os.path.abspath(_cache_target_db))
-        os.makedirs(target_dir, exist_ok=True)
-
-        # Two-tier cache decision: detect if target is on remote storage.
-        # If remote (NFS/CIFS), write to local scratch and merge back after eval.
-        # If local or unknown, write directly to target.
-        target_fs = detect_fs_type(_cache_target_db)
-        if target_fs == FsType.REMOTE:
-            local_scratch = find_local_scratch()
-            if local_scratch is not None:
-                _cache_is_two_tier = True
-                local_cache_dir = os.path.join(local_scratch, "lmms_eval_cache", model_hash)
-                os.makedirs(local_cache_dir, exist_ok=True)
-                # Shared DB: the user-specified NFS path (read-only during eval)
-                _cache_shared_db = _cache_target_db if os.path.exists(_cache_target_db) else None
-                # Write DB: local scratch (fast writes)
-                if world_size > 1:
-                    _cache_write_db = os.path.join(local_cache_dir, f"shard.{global_rank}.db")
-                    _cache_write_audit = os.path.join(local_cache_dir, f"shard.{global_rank}.audit.jsonl")
-                    # Multi-node: each node's local scratch is invisible to rank 0.
-                    # Use a shared staging dir on the target FS for consolidation.
-                    _cache_staging_dir = os.path.splitext(_cache_target_db)[0] + ".staging"
-                    os.makedirs(_cache_staging_dir, exist_ok=True)
-                else:
-                    _cache_write_db = os.path.join(local_cache_dir, "local.db")
-                    _cache_write_audit = os.path.join(local_cache_dir, "local.audit.jsonl")
-                eval_logger.info(f"ResponseCache: two-tier mode - writes to {_cache_write_db}, " f"reads from local + shared ({_cache_target_db})")
-            else:
-                eval_logger.warning("ResponseCache: target is on remote FS but no local scratch found, writing directly")
-
-        # Fallback: direct write to target (local FS, or no scratch available)
-        if not _cache_is_two_tier:
-            if world_size > 1:
-                _cache_write_db = f"{_cache_target_db}.shard.{global_rank}"
-                _cache_write_audit = f"{_cache_target_db}.audit.shard.{global_rank}.jsonl"
-            else:
-                _cache_write_db = _cache_target_db
-                _cache_write_audit = _cache_target_audit
-
-        response_cache = ResponseCache(
-            db_path=_cache_write_db,
-            audit_path=_cache_write_audit,
-            model_fingerprint=model_fp,
-            task_fingerprints=task_fingerprints,
-            shared_db_path=_cache_shared_db,
-            eval_version=get_lmms_eval_cache_version(),
-        )
-        eval_logger.info(f"ResponseCache initialized: {_cache_write_db}")
 
     eval_succeeded = False
     try:
@@ -428,84 +505,11 @@ def simple_evaluate(
         eval_succeeded = True
     finally:
         if response_cache is not None:
-            stats = response_cache.get_stats()
-            shared_info = f", {stats.get('hits_shared', 0)} from shared DB" if stats.get("hits_shared", 0) else ""
-            eval_logger.info(f"ResponseCache stats: {stats['hits']} hits{shared_info}, " f"{stats['misses']} misses, {stats['skipped_non_deterministic']} skipped, " f"hit rate: {stats['hit_rate']:.1%}")
-            response_cache.close()
-
-            # Post-eval consolidation: only on success, rank 0 only.
-            if eval_succeeded and global_rank == 0:
-                if _cache_is_two_tier and world_size > 1 and _cache_staging_dir:
-                    # Two-tier multi-node: each rank copies its local shard to shared staging.
-                    # Rank 0 does its own copy here; other ranks copy below after barrier.
-                    import shutil
-
-                    for src in (_cache_write_db, _cache_write_audit):
-                        if os.path.exists(src):
-                            shutil.copy2(src, _cache_staging_dir)
-
-            # Barrier: all ranks must finish writing before rank 0 merges.
-            if eval_succeeded and response_cache is not None and world_size > 1:
-                if distributed_executor_backend == "accelerate" and hasattr(lm, "accelerator"):
-                    lm.accelerator.wait_for_everyone()
-                elif distributed_executor_backend == "torchrun":
-                    import torch.distributed as dist
-
-                    if dist.is_initialized():
-                        dist.barrier()
-
-            # Non-rank-0: copy local shards to staging (two-tier multi-node).
-            if eval_succeeded and response_cache is not None:
-                if _cache_is_two_tier and world_size > 1 and _cache_staging_dir and global_rank != 0:
-                    import shutil
-
-                    for src in (_cache_write_db, _cache_write_audit):
-                        if os.path.exists(src):
-                            shutil.copy2(src, _cache_staging_dir)
-
-            # Second barrier: ensure all copies to staging are done.
-            if eval_succeeded and response_cache is not None and _cache_is_two_tier and world_size > 1:
-                if distributed_executor_backend == "accelerate" and hasattr(lm, "accelerator"):
-                    lm.accelerator.wait_for_everyone()
-                elif distributed_executor_backend == "torchrun":
-                    import torch.distributed as dist
-
-                    if dist.is_initialized():
-                        dist.barrier()
-
-            # Rank 0: merge all shards into the target DB.
-            if eval_succeeded and global_rank == 0:
-                if _cache_is_two_tier:
-                    if world_size > 1 and _cache_staging_dir:
-                        # Merge from shared staging dir.
-                        shard_db_paths = [os.path.join(_cache_staging_dir, f"shard.{r}.db") for r in range(world_size)]
-                        shard_audit_paths = [os.path.join(_cache_staging_dir, f"shard.{r}.audit.jsonl") for r in range(world_size)]
-                    else:
-                        shard_db_paths = [_cache_write_db]
-                        shard_audit_paths = [_cache_write_audit]
-                    ResponseCache.consolidate_cache(
-                        target_db_path=_cache_target_db,
-                        shard_db_paths=shard_db_paths,
-                        shard_audit_paths=shard_audit_paths,
-                        target_audit_path=_cache_target_audit,
-                        cleanup=True,
-                    )
-                    # Clean up staging dir.
-                    if _cache_staging_dir and os.path.isdir(_cache_staging_dir):
-                        import shutil
-
-                        shutil.rmtree(_cache_staging_dir, ignore_errors=True)
-                elif world_size > 1:
-                    # Direct mode, multi-GPU: merge per-rank shards into target.
-                    shard_db_paths = [f"{_cache_target_db}.shard.{r}" for r in range(world_size)]
-                    shard_audit_paths = [f"{_cache_target_db}.audit.shard.{r}.jsonl" for r in range(world_size)]
-                    ResponseCache.consolidate_cache(
-                        target_db_path=_cache_target_db,
-                        shard_db_paths=shard_db_paths,
-                        shard_audit_paths=shard_audit_paths,
-                        target_audit_path=_cache_target_audit,
-                        cleanup=True,
-                    )
+            response_cache.finalize(
+                success=eval_succeeded,
+                dist_backend=distributed_executor_backend,
+                accelerator=getattr(lm, "accelerator", None),
+            )
     if global_rank == 0:
         from lmms_eval.models.model_utils.gen_metrics import summarize_logged_metrics
 
@@ -860,6 +864,17 @@ def evaluate(
     world_size = int(os.environ.get("WORLD_SIZE", 1))
     eval_logger.info(f"Running on rank {global_rank} (local rank {local_rank})")
 
+    def _infer_task_request_type(task_obj: Task) -> Optional[str]:
+        if task_obj.instances:
+            return task_obj.instances[0].request_type
+
+        output_type = getattr(task_obj, "OUTPUT_TYPE", None)
+        if output_type == "multiple_choice":
+            return "loglikelihood"
+        if isinstance(output_type, str):
+            return output_type
+        return None
+
     # get lists of group hierarchy and each type of request
     eval_tasks = get_task_list(task_dict)
     name_to_task = {}
@@ -942,25 +957,53 @@ def evaluate(
             else:
                 raise ValueError(f"Invalid distributed_executor_backend: {distributed_executor_backend}. Choose either 'accelerate' or 'torchrun'.")
 
-            # "multiple_choice" task types dispatch (several) "loglikelihood" request types
-            reqtype = task.instances[0].request_type
+            # "multiple_choice" task types dispatch "loglikelihood" requests.
+            local_reqtype = _infer_task_request_type(task)
+            reqtype = local_reqtype
+            if dist.is_available() and dist.is_initialized():
+                gathered_reqtypes = [None] * world_size
+                dist.all_gather_object(gathered_reqtypes, local_reqtype)
+                reqtype = next((rt for rt in gathered_reqtypes if rt is not None), None)
+
             # compute number of pseudo-batches to pad with (FSDP/DDP require even batches among ranks)
             numpad = max(gathered_item) - gathered_item[lm.rank]
-            # todo: may not account for padding in cases like SquadV2 which has multiple req types
-            padding_requests[reqtype] += numpad
+            if reqtype is None:
+                eval_logger.warning(f"Task: {task_output.task_name}; unable to infer request type on rank {global_rank}, skipping padding computation.")
+            else:
+                # todo: may not account for padding in cases like SquadV2 which has multiple req types
+                padding_requests[reqtype] += numpad
 
     ### Run LMM on inputs, get all outputs ###
+    if world_size > 1 and dist.is_available() and dist.is_initialized():
+        local_reqtypes = list(requests.keys())
+        gathered_reqtypes = [None] * world_size
+        dist.all_gather_object(gathered_reqtypes, local_reqtypes)
+        canonical_reqtypes = []
+        for rank_reqtypes in gathered_reqtypes:
+            if not rank_reqtypes:
+                continue
+            for reqtype in rank_reqtypes:
+                if reqtype not in canonical_reqtypes:
+                    canonical_reqtypes.append(reqtype)
+    else:
+        canonical_reqtypes = list(requests.keys())
+
     # execute each type of request
-    for reqtype, reqs in requests.items():
+    for reqtype in canonical_reqtypes:
+        reqs = requests.get(reqtype, [])
         eval_logger.info("Running {} requests".format(reqtype))
         # create `K` copies of each request `req` based off `K = req.repeats`
         cloned_reqs = []
+        pad_source = reqs[-1] if reqs else None
         for req in reqs:
             cloned_reqs.extend([req] * req.repeats)
 
         if (world_size > 1) and (padding_requests[reqtype] > 0):
-            for _ in range(padding_requests[reqtype]):
-                cloned_reqs.extend([req] * req.repeats)
+            if pad_source is None:
+                eval_logger.warning(f"Running {reqtype} requests but could not find a pad source request on rank {global_rank}; skipping rank padding.")
+            else:
+                for _ in range(padding_requests[reqtype]):
+                    cloned_reqs.extend([pad_source] * pad_source.repeats)
 
         # run requests through model (with optional response cache)
         if reqtype == "generate_until_agentic":
@@ -1026,7 +1069,25 @@ def evaluate(
         for instances in instances_by_doc_id.values():
             instances.sort(key=lambda x: x.idx)
         # iterate over different filters used
-        for filter_key in task.instances[0].filtered_resps.keys():
+        local_filter_keys = list(task.instances[0].filtered_resps.keys()) if task.instances else []
+        if WORLD_SIZE > 1 and dist.is_available() and dist.is_initialized():
+            gathered_filter_keys = [None] * WORLD_SIZE
+            dist.all_gather_object(gathered_filter_keys, local_filter_keys)
+            filter_keys = []
+            for rank_keys in gathered_filter_keys:
+                if not rank_keys:
+                    continue
+                for filter_key in rank_keys:
+                    if filter_key not in filter_keys:
+                        filter_keys.append(filter_key)
+        else:
+            filter_keys = local_filter_keys
+
+        if len(filter_keys) == 0:
+            eval_logger.warning(f"Task: {task_output.task_name}; no filter keys available on rank {RANK}.")
+            continue
+
+        for filter_key in filter_keys:
             # Resolve reasoning tags for this task
             cli_reasoning_tags = getattr(cli_args, "reasoning_tags", None) if cli_args else None
             task_reasoning_tags = getattr(task.config, "reasoning_tags", None)
@@ -1106,6 +1167,8 @@ def evaluate(
                             # else:
                             #     filtered_arguments.append(_handle_non_serializable(value))
 
+                    input_media = _collect_input_media(doc, filtered_arguments)
+
                     per_sample_tc = []
                     for req in requests:
                         if req.token_counts:
@@ -1131,6 +1194,8 @@ def evaluate(
                             )
                         ),
                     }
+                    if input_media:
+                        example["input_media"] = input_media
                     example.update(metrics)
                     task_output.logged_samples.append(example)
                 for metric, value in metrics.items():
