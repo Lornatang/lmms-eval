@@ -38,7 +38,7 @@ torch.backends.cuda.matmul.allow_tf32 = True
 
 
 @register_model("jingyu")
-class JingyuVL(lmms):
+class Jingyu(lmms):
 
     def __init__(
         self,
