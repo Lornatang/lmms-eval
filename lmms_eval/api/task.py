@@ -59,6 +59,7 @@ ALL_OUTPUT_TYPES = [
     "generate_until",
     "generate_until_multi_round",
     "generate_until_agentic",
+    "generate_visual_cot",
 ]
 
 
@@ -1035,8 +1036,11 @@ class ConfigurableTask(Task):
                     force_unzip = dataset_kwargs.get("force_unzip", False)
                     revision = dataset_kwargs.get("revision", "main")
                     create_link = dataset_kwargs.get("create_link", False)
-                    # If the user already has a cache dir, we skip download the zip files
-                    if not os.path.exists(cache_dir):
+                    cache_path = None
+                    # If the user already has a cache dir, we skip downloading archives.
+                    # Tasks that set create_link need the snapshot path even when the
+                    # cache dir already exists as a symlink from a previous run.
+                    if not os.path.exists(cache_dir) or (create_link and os.path.islink(cache_dir)):
                         cache_path = snapshot_download(repo_id=self.DATASET_PATH, revision=revision, repo_type="dataset", force_download=force_download, etag_timeout=60)
                         zip_files = glob(os.path.join(cache_path, "**/*.zip"), recursive=True)
                         tar_files = glob(os.path.join(cache_path, "**/*.tar*"), recursive=True)
@@ -1105,7 +1109,7 @@ class ConfigurableTask(Task):
                                 untar_video_data(output_tar)
 
                     # Link cache_path to cache_dir if needed.
-                    if create_link:
+                    if create_link and cache_path is not None:
                         if not os.path.exists(cache_dir) or os.path.islink(cache_dir):
                             if os.path.islink(cache_dir):
                                 os.remove(cache_dir)
@@ -1157,21 +1161,24 @@ class ConfigurableTask(Task):
                 if split in [self.config.training_split, self.config.validation_split, self.config.test_split, self.config.fewshot_split]:
                     self.dataset[split] = self.config.process_docs(self.dataset[split])
 
-        # copy dataset, remove image features
-        self.dataset_no_image = self.dataset.copy()
-        for doc_name in self.dataset_no_image:
-            remove_cols = []
-            features = self.dataset_no_image[doc_name].features
-            # If it is an Image instance or a Sequence of Image instance. Remove it
-            for feature in features:
-                if isinstance(features[feature], Image):
-                    remove_cols.append(feature)
-                elif isinstance(features[feature], Sequence) and isinstance(features[feature].feature, Image):
-                    remove_cols.append(feature)
-                elif isinstance(features[feature], Audio):
-                    remove_cols.append(feature)
-            for remove_col in remove_cols:
-                self.dataset_no_image[doc_name] = self.dataset_no_image[doc_name].remove_columns(remove_col)
+        # copy dataset, remove image features (unless process_results needs them)
+        if getattr(self.config, "process_results_use_image", False):
+            self.dataset_no_image = self.dataset
+        else:
+            self.dataset_no_image = self.dataset.copy()
+            for doc_name in self.dataset_no_image:
+                remove_cols = []
+                features = self.dataset_no_image[doc_name].features
+                # If it is an Image instance or a Sequence of Image instance. Remove it
+                for feature in features:
+                    if isinstance(features[feature], Image):
+                        remove_cols.append(feature)
+                    elif isinstance(features[feature], Sequence) and isinstance(features[feature].feature, Image):
+                        remove_cols.append(feature)
+                    elif isinstance(features[feature], Audio):
+                        remove_cols.append(feature)
+                for remove_col in remove_cols:
+                    self.dataset_no_image[doc_name] = self.dataset_no_image[doc_name].remove_columns(remove_col)
 
     def has_training_docs(self) -> bool:
         if self.config.training_split is not None:
@@ -1560,6 +1567,8 @@ class ConfigurableTask(Task):
 
         elif self.OUTPUT_TYPE == "generate_until":
             arguments = (ctx, copy.deepcopy(self.config.generation_kwargs), self.doc_to_visual, doc_id, self.config.task, split)
+        elif self.OUTPUT_TYPE == "generate_visual_cot":
+            arguments = (ctx, copy.deepcopy(self.config.generation_kwargs), self.doc_to_visual, doc_id, self.config.task, split)
         elif self.OUTPUT_TYPE == "generate_until_multi_round":
             arguments = (ctx, copy.deepcopy(self.config.generation_kwargs), self.doc_to_visual, partial(self.config.doc_to_text, lmms_eval_specific_kwargs=self.lmms_eval_specific_kwargs), doc_id, self.config.task, split)
         elif self.OUTPUT_TYPE == "generate_until_agentic":
@@ -1569,7 +1578,7 @@ class ConfigurableTask(Task):
     # TODO: we add a full_docs interface here for some evaluations that needs to access the full datasets during process_results function. we may have better ways to handle this.
     @retry(stop=(stop_after_attempt(5) | stop_after_delay(1200)), wait=wait_fixed(2))
     def process_results(self, doc, results, full_docs=None):
-        if self.OUTPUT_TYPE == "generate_until":
+        if self.OUTPUT_TYPE in ("generate_until", "generate_visual_cot"):
             if isinstance(results, list) and isinstance(results[0], list):
                 results = [res.strip() for res in results[0]]
             else:
@@ -1766,7 +1775,17 @@ class ConfigurableMessagesTask(ConfigurableTask):
                     if isinstance(visual, PIL_Image.Image):
                         content.append({"type": "image", "url": visual})
                     elif isinstance(visual, dict):
-                        content.append({"type": "audio", "url": visual})
+                        # Dict visuals carry explicit type (default: video).
+                        # Metadata keys (video_start, video_end, etc.) are
+                        # preserved in the url field so they flow through
+                        # ChatVideoContent → extract_media → fetch_video.
+                        media_type = visual.get("type", "video")
+                        has_metadata = any(k in visual for k in ("video_start", "video_end"))
+                        if has_metadata:
+                            media_url = visual  # pass full dict as url
+                        else:
+                            media_url = visual.get("url") or visual.get("path") or visual
+                        content.append({"type": media_type, "url": media_url})
                     elif isinstance(visual, str):
                         ext = os.path.splitext(visual)[1].lower()
                         if ext in _IMAGE_EXTS:
