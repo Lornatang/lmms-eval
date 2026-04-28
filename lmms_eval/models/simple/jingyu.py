@@ -28,16 +28,16 @@ from lmms_eval.api.registry import register_model
 
 warnings.filterwarnings("ignore")
 
-from jingyu_vl.constants import DEFAULT_IMAGE_TOKEN, IMAGE_TOKEN_INDEX
-from jingyu_vl.conversation import conv_templates
-from jingyu_vl.utils.checkpoint import load_pretrained_model
-from jingyu_vl.utils.ops import process_images, tokenizer_image_token
+from jingyu.constants import DEFAULT_IMAGE_TOKEN, IMAGE_TOKEN_INDEX
+from jingyu.conversation import conv_templates
+from jingyu.utils.checkpoint import load_pretrained_model
+from jingyu.utils.ops import process_images, tokenizer_image_token
 from loguru import logger as eval_logger
 
 torch.backends.cuda.matmul.allow_tf32 = True
 
 
-@register_model("jingyu_vl")
+@register_model("jingyu")
 class JingyuVL(lmms):
 
     def __init__(
