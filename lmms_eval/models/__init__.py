@@ -50,6 +50,7 @@ AVAILABLE_SIMPLE_MODELS = {
     "internvl3": "InternVL3",
     "internvl3_5": "InternVL3_5",
     "jingyu": "Jingyu",
+    "jingyu2_1": "Jingyu2_1",
     "kimi_audio": "KimiAudio",
     "llama_vid": "LLaMAVid",
     "llama_vision": "LlamaVision",
