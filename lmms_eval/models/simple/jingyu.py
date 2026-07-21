@@ -254,7 +254,9 @@ class Jingyu(lmms):
             until = [until]
         elif not isinstance(until, list):
             raise ValueError(f"Expected `gen_kwargs['until']` to be of type Union[str, list], but got {type(until)}")
-        until = [item for item in until if item != "\n\n"]
+        # Drop newline stop strings: many chat models emit a leading "\n" before the answer,
+        # and splitting on "\n" would incorrectly yield an empty string.
+        until = [item for item in until if item not in ("\n", "\n\n")]
 
         if isinstance(contexts, tuple):
             contexts = list(contexts)
@@ -368,17 +370,28 @@ class Jingyu(lmms):
                 generate_kwargs = self._build_generate_kwargs(gen_kwargs)
                 cont = self.model.generate(**inputs, **generate_kwargs)
 
-                generated_ids_trimmed = [out_ids[len(in_ids) :] for in_ids, out_ids in zip(inputs["input_ids"], cont)]
+                # Some Jingyu checkpoints return full sequences (prompt + new tokens); others return
+                # only newly generated tokens. Trim only when the prompt prefix is present.
+                generated_ids_trimmed = []
+                for in_ids, out_ids in zip(inputs["input_ids"], cont):
+                    in_len = in_ids.shape[-1]
+                    if out_ids.shape[-1] > in_len and torch.equal(out_ids[:in_len], in_ids.to(out_ids.device)):
+                        generated_ids_trimmed.append(out_ids[in_len:])
+                    elif out_ids.shape[-1] > in_len:
+                        generated_ids_trimmed.append(out_ids[in_len:])
+                    else:
+                        generated_ids_trimmed.append(out_ids)
                 answers = self.processor.batch_decode(
                     generated_ids_trimmed,
                     skip_special_tokens=True,
                     clean_up_tokenization_spaces=False,
                 )
                 for i, ans in enumerate(answers):
+                    ans = ans.strip()
                     for term in until:
                         if len(term) > 0:
                             ans = ans.split(term)[0]
-                    answers[i] = ans
+                    answers[i] = ans.strip()
 
                 for ans, context in zip(answers, contexts):
                     res.append(ans)
